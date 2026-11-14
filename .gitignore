@@ -1,0 +1,15 @@
+# 二进制
+netsuck
+*.exe
+
+# 本地测试产物
+/data/
+*.db
+*.db-wal
+*.db-shm
+/test_config.yaml
+
+# IDE / 系统
+.DS_Store
+.idea/
+.vscode/
