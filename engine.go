@@ -939,6 +939,9 @@ func (e *Engine) publishErrorMsg(id int64, gen uint64, msg string) {
 func (e *Engine) eligible(id int64, gen uint64, kind requestKind) bool {
 	e.stateMu.RLock()
 	defer e.stateMu.RUnlock()
+	if e.quotaSwitching.Load() {
+		return false // M1：限额切换期间拒绝新下载与探活（不发 HTTP，探活归本地 Skipped）
+	}
 	if e.changing[id] {
 		return false // F8：CRUD 进行中，拒绝下载与探活准入
 	}
@@ -1300,7 +1303,7 @@ func (e *Engine) readLoop(ctx context.Context, t *target, gen uint64, body io.Re
 		}
 		// U1/P2：版本校验/重预约移到 waitRate 结束后、紧邻实际 Read —— 限额/跨日在等待期间变化时，
 		// 释放旧预留并按当前预算重预约；若新读长增大则补等相应速率令牌（完整重试协议），再进入 Read。
-		rateBudget := tok.amount // 已为该量等待过速率令牌
+		rateBudget := tok.amount // 已支付（等待过令牌）的读长上界
 		for tok.amount != 0 && tok.version != e.quotaVersion() {
 			e.releaseTokenBooking(tok)
 			tok = e.quotaReserve(int64(len(buf)))
@@ -1310,8 +1313,8 @@ func (e *Engine) readLoop(ctx context.Context, t *target, gen uint64, body io.Re
 					e.settleRead(tok, t, 0)
 					return err
 				}
+				rateBudget = tok.amount // 仅增大时抬升已支付预算（M3：缩小不降，避免重复支付）
 			}
-			rateBudget = tok.amount
 		}
 		if tok.amount == 0 {
 			return errQuotaReached
@@ -2193,7 +2196,8 @@ func (e *Engine) probeRead(ctx context.Context, t *target, body io.Reader) error
 		e.settleRead(tok, t, 0)
 		return err
 	}
-	// U1/P2：版本校验/重预约移到 waitRate 后、紧邻实际 Read；新读长增大补等速率令牌。
+	// U1/P2/M3：版本校验/重预约移到 waitRate 后、紧邻实际 Read；新读长增大补等差额令牌，
+	// 已支付预算只在增大时抬升（缩小不降，避免重复支付已等待令牌）。
 	rateBudget := tok.amount
 	for tok.amount != 0 && tok.version != e.quotaVersion() {
 		e.releaseTokenBooking(tok)
@@ -2203,8 +2207,8 @@ func (e *Engine) probeRead(ctx context.Context, t *target, body io.Reader) error
 				e.settleRead(tok, t, 0)
 				return err
 			}
+			rateBudget = tok.amount
 		}
-		rateBudget = tok.amount
 	}
 	if tok.amount == 0 {
 		return nil // 配额触达，本次探活不读字节（不影响健康）
@@ -2582,7 +2586,8 @@ func (e *Engine) beginQuotaSwitch() error {
 // endQuotaSwitch 恢复准入（P1）。
 func (e *Engine) endQuotaSwitch() {
 	e.quotaSwitching.Store(false)
-	e.setBlocked(false)
+	// M2：按旧 paused/时段/配额重算门禁（不无条件 setBlocked(false)；切换前已暂停/时段外则保持阻塞）。
+	e.recomputeGate()
 }
 
 // drainInFlightReads 等待全部在途读（下载 + 探活）结算完毕（P1）。

@@ -2292,8 +2292,12 @@ func TestP2ReReserveLargerReWaitsRate(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() { done <- e.readLoop(context.Background(), tgt, 1, body, io.Discard) }()
-	// 等 reader 进入首个预约的 waitRate（4000B/s 下 1000B 约 0.25s），期间提高配额。
-	time.Sleep(100 * time.Millisecond)
+	// 真实预约进入 barrier：确认 reader 已进入 waitRate（在途预留 reserved>0）后再提高配额。
+	waitCondition(t, func() bool {
+		e.countMu.Lock()
+		defer e.countMu.Unlock()
+		return e.reserved[e.currentDay] > 0
+	}, "reader 已预约（进入 waitRate）")
 	if err := e.SetDailyLimit(0.000008); err != nil { // Q2=8000（更大有限配额）
 		t.Fatal(err)
 	}
@@ -2376,4 +2380,142 @@ func TestE1RecomputeGateDuringSwitch(t *testing.T) {
 	e.endQuotaSwitch()
 	e.recomputeGate()
 	e.Stop()
+}
+
+// M1：切换期间新探活不发 HTTP（eligible 含 quotaSwitching）。
+func TestM1QuotaSwitchBlocksNewProbe(t *testing.T) {
+	var reqCount atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqCount.Add(1)
+		w.Write(make([]byte, 16))
+	}))
+	t.Cleanup(srv.Close)
+
+	e, _ := newTestEngine(t, nil, true)
+	rec, err := e.CreateTarget(TargetPatch{Name: ptrStr("m1"), URL: ptrStr(srv.URL), Weight: ptrInt(10), Enabled: ptrBool(true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitHealthy(t, e, rec.ID)
+	if err := e.beginQuotaSwitch(); err != nil {
+		t.Fatal(err)
+	}
+	// 先等取消的在途请求完成，再取 base 测量切换窗口无新请求。
+	waitCondition(t, func() bool { return e.activeConns.Load() == 0 && e.probesDrained() }, "切换中在途清空")
+	base := reqCount.Load()
+	// 显式 enqueue 新探活（切换期间应被 eligible 拦截，不发 HTTP）。
+	e.enqueueProbe(rec.ID)
+	time.Sleep(200 * time.Millisecond)
+	if got := reqCount.Load(); got != base {
+		t.Fatalf("切换期间新探活不应发 HTTP: %d > %d", got, base)
+	}
+	e.endQuotaSwitch()
+	e.Stop()
+}
+
+// M2：ApplyConfigUpdate 排空超时 → persist 调用 0 次、运行参数不变。
+func TestM2ApplyConfigDrainTimeoutNoPersist(t *testing.T) {
+	e, _ := newTestEngine(t, nil, true)
+	if err := e.SetDailyLimit(0.00001); err != nil {
+		t.Fatal(err)
+	}
+	e.quotaSwitchDeadline = 200 * time.Millisecond
+	e.activeConns.Add(1) // 模拟永不结算的在途读，使排空超时
+
+	var persistCalled int
+	cand := DefaultConfig()
+	cand.DailyLimitGB = 0.0000001 // 收紧 100
+	cand.MaxRateMbps = 5
+	err := e.ApplyConfigUpdate(cand, func() error { persistCalled++; return nil })
+	if err == nil {
+		t.Fatalf("排空超时应返回错误")
+	}
+	if persistCalled != 0 {
+		t.Fatalf("排空失败不应 persist: %d", persistCalled)
+	}
+	e.stateMu.RLock()
+	rate := e.maxRateMbps
+	e.stateMu.RUnlock()
+	if e.dailyLimit.Load() != 10000 {
+		t.Fatalf("限额应保持旧值: %d", e.dailyLimit.Load())
+	}
+	if rate != 0 {
+		t.Fatalf("运行参数应不变: rate=%d", rate)
+	}
+	e.activeConns.Add(-1)
+}
+
+// M2：ApplyConfigUpdate 排空成功但 persist 失败 → 旧参数与旧门禁恢复。
+func TestM2ApplyConfigPersistFailRestores(t *testing.T) {
+	e, _ := newTestEngine(t, nil, true)
+	if err := e.SetDailyLimit(0.00001); err != nil {
+		t.Fatal(err)
+	}
+	cand := DefaultConfig()
+	cand.DailyLimitGB = 0.0000001 // 收紧 100（排空无在途读，成功）
+	cand.MaxRateMbps = 5
+	err := e.ApplyConfigUpdate(cand, func() error { return fmt.Errorf("save failed") })
+	if err == nil {
+		t.Fatalf("persist 失败应返回错误")
+	}
+	if e.dailyLimit.Load() != 10000 {
+		t.Fatalf("限额应保持旧值: %d", e.dailyLimit.Load())
+	}
+	if e.quotaSwitching.Load() {
+		t.Fatalf("persist 失败后 quotaSwitching 应复位（旧门禁恢复）")
+	}
+	e.stateMu.RLock()
+	rate := e.maxRateMbps
+	e.stateMu.RUnlock()
+	if rate != 0 {
+		t.Fatalf("运行参数应不变: rate=%d", rate)
+	}
+}
+
+// M3：重预约小→大→小→大时，已支付预算（rateBudget）只在增大时抬升——缩小不降，避免重复支付已等待令牌。
+func TestM3ReReserveShrinkKeepsPaidBudget(t *testing.T) {
+	e, _ := newTestEngine(t, nil, true)
+	tgt := &target{id: 140, total: new(atomic.Int64)}
+	e.stateMu.Lock()
+	e.targets[140] = tgt
+	e.stateMu.Unlock()
+	body := io.LimitReader(zeroReader{}, 1<<20)
+
+	// 低速 8000 B/s + 耗尽 burst。
+	e.limiter.SetLimit(rate.Limit(8000))
+	e.rateSig.signal()
+	if err := e.limiter.WaitN(context.Background(), 64*1024); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SetDailyLimit(0.000001); err != nil { // Q1=1000
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() { done <- e.readLoop(context.Background(), tgt, 1, body, io.Discard) }()
+	time.Sleep(60 * time.Millisecond) // reader 进入 waitRate(1000)
+	// 小→大→小→大：grow(8000) 补差额、shrink(2000) 保持已支付预算、再 grow(8000) 不应再补差额。
+	e.SetDailyLimit(0.000008) // 8000（grow）
+	time.Sleep(50 * time.Millisecond)
+	e.SetDailyLimit(0.000002) // 2000（shrink）
+	time.Sleep(30 * time.Millisecond)
+	e.SetDailyLimit(0.000008) // 8000（grow back）
+
+	// 等待读到 ≥8000（最终配额）。正确总等待 ≈ 0.125s+0.875s=1.0s；若 shrink 覆盖预算致重复支付 ≈ 1.875s。
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && tgt.total.Load() < 8000 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if tgt.total.Load() < 8000 {
+		t.Fatalf("应读到 ≥8000, got %d", tgt.total.Load())
+	}
+	elapsed := time.Since(start)
+	// 上界：1.0s 正确等待 + 充足缓冲（1.2s）；重复支付(≈1.875s)会超出。
+	if elapsed > 2.0*time.Second {
+		t.Fatalf("重预约缩小未保持已支付预算（重复支付令牌）: 读取耗时 %v", elapsed)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+	}
 }
