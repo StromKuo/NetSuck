@@ -867,3 +867,62 @@ func TestHistory24hAcrossDSTSpringForward(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// A1：generation 屏障——改 URL（原子推进代际）后，旧代际健康批不得覆盖/复活旧冷却。
+func TestA1GenerationBarrierPreservesState(t *testing.T) {
+	store := newTestStore(t)
+	created := mustCreateTarget(t, store, "A", "https://example.com/a.bin", 7, true)
+
+	// 写旧代际健康（RateLimited + 冷却，gen1）。
+	err := store.PersistBatch(CounterBatch{
+		TargetHealth: map[int64]TargetHealthPersist{
+			created.ID: {Health: "RateLimited", CooldownUntilMS: 111111, LastStatusCode: 403, LatencyMS: 40, ErrorMsg: "limited", ConsecutiveErrors: 0, Generation: 1},
+		},
+		Seq: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed gen1 health: %v", err)
+	}
+	// 改 URL（resetHealth=true）→ 原子推进 generation 至 2，健康置 Unknown。
+	rec, err := store.PatchTargetAtomic(created.ID, TargetPatch{URL: strPtr("https://example.com/a2.bin")}, true)
+	if err != nil {
+		t.Fatalf("PatchTargetAtomic: %v", err)
+	}
+	if rec.Health != "Unknown" || rec.CooldownUntilMS != 0 || rec.Generation != 2 {
+		t.Fatalf("改 URL 后应 Unknown/cooldown0/gen2: %+v", rec)
+	}
+	// 旧代际（gen1）健康批不得覆盖新代际（gen2）的 Unknown（屏障拦截）。
+	err = store.PersistBatch(CounterBatch{
+		TargetHealth: map[int64]TargetHealthPersist{
+			created.ID: {Health: "RateLimited", CooldownUntilMS: 222222, LastStatusCode: 403, LatencyMS: 40, ErrorMsg: "limited", ConsecutiveErrors: 0, Generation: 1},
+		},
+		Seq: 2,
+	})
+	if err != nil {
+		t.Fatalf("stale batch: %v", err)
+	}
+	after, err := store.PatchTarget(created.ID, TargetPatch{})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if after.Health != "Unknown" || after.CooldownUntilMS != 0 {
+		t.Fatalf("旧代际批不得复活旧冷却: %+v", after)
+	}
+	// 正确代际（gen2）批可写（控制组）。
+	err = store.PersistBatch(CounterBatch{
+		TargetHealth: map[int64]TargetHealthPersist{
+			created.ID: {Health: "Healthy", CooldownUntilMS: 0, LastStatusCode: 200, LatencyMS: 10, ErrorMsg: "", ConsecutiveErrors: 0, Generation: 2},
+		},
+		Seq: 3,
+	})
+	if err != nil {
+		t.Fatalf("gen2 batch: %v", err)
+	}
+	after2, err := store.PatchTarget(created.ID, TargetPatch{})
+	if err != nil {
+		t.Fatalf("read2: %v", err)
+	}
+	if after2.Health != "Healthy" {
+		t.Fatalf("正确代际应可写健康: %+v", after2)
+	}
+}

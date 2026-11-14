@@ -1081,8 +1081,8 @@ func TestDSTDuplicateHourBuckets(t *testing.T) {
 		t.Fatalf("countBytes 后两键仍相同")
 	}
 
-	// History24h 窗口（自 second 之后 2h=03:00 EST）须呈现第二重复小时的桶值。
-	ref := second.Add(3 * time.Hour) // 04:30 EST（完全错开重复小时）
+	// History24h 恢复时刻改为第二次 01:30（DST 重复小时窗口内）须呈现两重复小时桶。
+	ref := second // 第二次 01:30 EST
 	hist, err := e.History24h(ref)
 	if err != nil {
 		t.Fatalf("History24h: %v", err)
@@ -1851,4 +1851,129 @@ func TestR1RedirectHostOwnership(t *testing.T) {
 	if got := tb.current().maxSeen.Load(); got > 1 {
 		t.Fatalf("重定向释放后 hop host 并发超过 1（R1 重复释放）: %d", got)
 	}
+}
+
+// A2：quota version 真正生效——旧无限 token 在有限新预算下不得与新的重叠。
+func TestA2QuotaVersionNoOverlap(t *testing.T) {
+	e, _ := newTestEngine(t, nil, true)
+	tgt := &target{id: 101, total: new(atomic.Int64)}
+	e.stateMu.Lock()
+	e.targets[101] = tgt
+	e.stateMu.Unlock()
+
+	e.SetDailyLimit(0) // 无限
+	tokU := e.quotaReserve(100) // 旧无限 token（booked=false, version V1）
+	if tokU.amount != 100 || tokU.booked {
+		t.Fatalf("旧无限 token: amount=%d booked=%v", tokU.amount, tokU.booked)
+	}
+	e.SetDailyLimit(0.0000001) // 新上限 100（V2）
+	tokF := e.quotaReserve(100) // 新有限 token
+	if tokF.amount != 100 || !tokF.booked {
+		t.Fatalf("新有限 token: amount=%d booked=%v", tokF.amount, tokF.booked)
+	}
+	// 旧 token 读前重校验：释放旧（无限，无预留）+ 重按当前预算预约。
+	// 当前 reserved=100（新 token 的 booking）、globalDays=0 → avail=0 → 旧 token 被挡（不得放行重叠预算）。
+	re := e.quotaReserve(100)
+	if re.amount != 0 {
+		t.Fatalf("旧无限 token 在新有限预算下应被挡（不得放行两份重叠预算）: amount=%d", re.amount)
+	}
+	// 结算：新 token 读 100，旧 token 读 0，总消费 100 ≤ 100。
+	e.settleRead(tokF, tgt, 100)
+	if got := tgt.total.Load(); got != 100 {
+		t.Fatalf("总消费应 100: got %d", got)
+	}
+}
+
+// A2：跨午夜旧日预留迁移到新日，合计不超新上限。
+func TestA2QuotaCrossMidnightMigration(t *testing.T) {
+	clk := &fakeClock{now: time.Date(2024, 1, 1, 23, 55, 0, 0, time.Local)}
+	e, _ := newTestEngine(t, clk, false) // 不启动，无 goroutine
+	tgt := &target{id: 102, total: new(atomic.Int64)}
+	e.stateMu.Lock()
+	e.targets[102] = tgt
+	e.stateMu.Unlock()
+	e.SetDailyLimit(0.00001) // 10000
+
+	dayOld := dayKey(clk.Now())
+	tokOld := e.quotaReserve(3000) // 旧日 3000 预留
+	if tokOld.amount != 3000 || tokOld.day != dayOld {
+		t.Fatalf("旧日预留 3000: %+v", tokOld)
+	}
+	clk.advance(10 * time.Minute) // 跨午夜
+	e.recomputeGate()
+	dayNew := dayKey(clk.Now())
+	if dayNew == dayOld {
+		t.Fatalf("未跨日")
+	}
+	// 旧 token 读前重校验：释放旧日预留、重按新日预算预约（迁移到新日 3000）。
+	e.releaseTokenBooking(tokOld)
+	tokMigrated := e.quotaReserve(3000)
+	if tokMigrated.amount != 3000 || tokMigrated.day != dayNew {
+		t.Fatalf("旧日预留应迁移到新日 3000: %+v", tokMigrated)
+	}
+	// 新日 reader 只余 7000（10000-3000），合计不超 10000。
+	tokNew := e.quotaReserve(7001)
+	if tokNew.amount > 7000 {
+		t.Fatalf("新日应只剩 7000 预算, 却给了 %d（合计超 10000）", tokNew.amount)
+	}
+	e.countMu.Lock()
+	used := int64(0)
+	if g := e.globalDays[dayNew]; g != nil {
+		used = g.Load()
+	}
+	used += e.reserved[dayNew]
+	e.countMu.Unlock()
+	if used > 10000 {
+		t.Fatalf("跨午夜合计在途+已读 %d 超 10000", used)
+	}
+}
+
+// A3：探活网络窗口跨越"头返回→body 延迟"仍 Healthy 且字节正确。
+func TestA3ProbeBodyDelayHealthy(t *testing.T) {
+	var bodyBytes atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(100 * time.Millisecond) // 头返回后延迟 body
+		bodyBytes.Add(16)
+		w.Write([]byte("0123456789abcdef"))
+	}))
+	t.Cleanup(srv.Close)
+
+	e, _ := newTestEngine(t, nil, true)
+	rec, err := e.CreateTarget(TargetPatch{Name: ptrStr("a3"), URL: ptrStr(srv.URL), Weight: ptrInt(10), Enabled: ptrBool(true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitHealthy(t, e, rec.ID) // 头已返回 + body 延迟 <10s → Healthy
+	if bodyBytes.Load() == 0 {
+		t.Fatalf("body 未读取（网络窗口未覆盖 body）")
+	}
+}
+
+// A3：真网络超时（服务端挂起不响应头）→ 探活置 Dead。
+func TestA3ProbeNetworkTimeoutDead(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // 挂起连接（不响应头），使探活网络窗口超时
+	}))
+	t.Cleanup(func() { close(release); srv.Close() })
+	e, _ := newTestEngine(t, nil, true)
+	rec, err := e.CreateTarget(TargetPatch{Name: ptrStr("a3t"), URL: ptrStr(srv.URL), Weight: ptrInt(10), Enabled: ptrBool(true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 网络窗口 10s，须等待足够长（>5s 默认）。
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		snap := e.Snapshot()
+		if ts, ok := allTargets(snap)[rec.ID]; ok && ts.Health == healthDead {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("探活网络超时未置 Dead")
 }

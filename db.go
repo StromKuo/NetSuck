@@ -47,6 +47,7 @@ type TargetRecord struct {
 	ErrorMsg          string     `json:"error_msg"`
 	ConsecutiveErrors int        `json:"consecutive_errors"`
 	TotalBytes        int64      `json:"total_bytes"` // 累计字节（含今日，R1）
+	Generation        uint64     `json:"-"`           // URL/健康变更代际（A1：健康写回屏障）
 	DeletedAt         *time.Time `json:"-"`
 }
 
@@ -66,6 +67,7 @@ type TargetHealthPersist struct {
 	LatencyMS         int64
 	ErrorMsg          string
 	ConsecutiveErrors int
+	Generation        uint64 // 快照代际（A1：PersistBatch 按代际屏障写回）
 }
 
 // CounterBatch 是不可变的计数快照，一次刷盘提交一批。
@@ -121,6 +123,7 @@ var schemaStatements = []string{
 		error_msg TEXT NOT NULL DEFAULT '',
 		consecutive_errors INTEGER NOT NULL DEFAULT 0,
 		total_bytes INTEGER NOT NULL DEFAULT 0,
+		generation INTEGER NOT NULL DEFAULT 1,
 		deleted_at INTEGER
 	)`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_targets_url_live ON targets(url) WHERE deleted_at IS NULL`,
@@ -141,7 +144,7 @@ var schemaStatements = []string{
 }
 
 const targetSelectColumns = `id, name, url, weight, enabled, health, cooldown_until_ms,
-	last_status_code, latency_ms, error_msg, consecutive_errors, total_bytes, deleted_at`
+	last_status_code, latency_ms, error_msg, consecutive_errors, total_bytes, generation, deleted_at`
 
 // sqliteDSN 构造契约指定的 DSN（WAL、busy_timeout、synchronous=NORMAL）。
 func sqliteDSN(path string) string {
@@ -376,7 +379,8 @@ func (s *Store) PatchTargetAtomic(id int64, p TargetPatch, resetHealth bool) (Ta
 		args = append(args, boolToInt(*p.Enabled))
 	}
 	if resetHealth {
-		sets = append(sets,
+		// A1：URL 变更同事务推进 generation，使旧健康批（低代际）被屏障拒绝。
+		sets = append(sets, "generation = generation + 1",
 			"health = ?", "cooldown_until_ms = ?", "consecutive_errors = ?",
 			"last_status_code = ?", "latency_ms = ?", "error_msg = ?")
 		args = append(args, "Unknown", int64(0), 0, 0, int64(0), "")
@@ -498,10 +502,13 @@ func (s *Store) PersistBatch(b CounterBatch) error {
 	}
 
 	for targetID, h := range b.TargetHealth {
+		// A1：健康写回带 generation 屏障——仅当代际不大于快照 gen 才写回，旧健康批不得覆盖
+		// PatchTargetAtomic 已推进的新代际（如改 URL 后旧 403 冷却批）。
+		// h.Generation==0 表示批次未携带代际信息（直接构造/旧数据），不启用屏障，保持兼容。
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE targets SET health = ?, cooldown_until_ms = ?, last_status_code = ?,
-			 latency_ms = ?, error_msg = ?, consecutive_errors = ? WHERE id = ?`,
-			h.Health, h.CooldownUntilMS, h.LastStatusCode, h.LatencyMS, h.ErrorMsg, h.ConsecutiveErrors, targetID,
+			 latency_ms = ?, error_msg = ?, consecutive_errors = ? WHERE id = ? AND (? <= 0 OR generation <= ?)`,
+			h.Health, h.CooldownUntilMS, h.LastStatusCode, h.LatencyMS, h.ErrorMsg, h.ConsecutiveErrors, targetID, h.Generation, h.Generation,
 		); err != nil {
 			return fmt.Errorf("db: batch health %d: %w", targetID, err)
 		}
@@ -727,13 +734,15 @@ func scanTargetRecord(sc rowScanner) (TargetRecord, error) {
 		enabled   int
 		deletedAt sql.NullInt64
 	)
+	var gen int64
 	if err := sc.Scan(
 		&rec.ID, &rec.Name, &rec.URL, &rec.Weight, &enabled, &rec.Health,
 		&rec.CooldownUntilMS, &rec.LastStatusCode, &rec.LatencyMS, &rec.ErrorMsg,
-		&rec.ConsecutiveErrors, &rec.TotalBytes, &deletedAt,
+		&rec.ConsecutiveErrors, &rec.TotalBytes, &gen, &deletedAt,
 	); err != nil {
 		return TargetRecord{}, err
 	}
+	rec.Generation = uint64(gen)
 	rec.Enabled = enabled != 0
 	if deletedAt.Valid {
 		t := time.UnixMilli(deletedAt.Int64)
@@ -744,9 +753,17 @@ func scanTargetRecord(sc rowScanner) (TargetRecord, error) {
 
 // localHourStarts 返回最近 24 个本地钟点小时的起始时刻，最旧在前、当前小时后最后。
 // 逐小时回退基于绝对时间，DST 重复/缺失小时按实际时间自然排序。
+// dbHourStartTime 返回 now 所在本地钟点小时的起点并保留 now 的实际偏移（绝对时刻截断到小时）。
+// 跨 DST 重复小时（fall-back 01:00 两次）各自独立，使 LoadEngineState/History24h 窗口含第二重复小时（A1/DST）。
+func dbHourStartTime(now time.Time) time.Time {
+	n := now.In(time.Local)
+	return n.Add(-time.Duration(n.Minute())*time.Minute -
+		time.Duration(n.Second())*time.Second -
+		time.Duration(n.Nanosecond()))
+}
+
 func localHourStarts(now time.Time) []time.Time {
-	local := now.In(time.Local)
-	current := time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), 0, 0, 0, time.Local)
+	current := dbHourStartTime(now)
 	starts := make([]time.Time, historyWindowHours)
 	for i := 0; i < historyWindowHours; i++ {
 		starts[historyWindowHours-1-i] = current.Add(-time.Duration(i) * time.Hour)

@@ -173,7 +173,7 @@ type Engine struct {
 	dailyLimit   atomic.Int64                     // 每日字节上限（0=不限）
 	globalTotal  atomic.Int64                     // 全局全量累计（永不清零，供采样）
 	reserved     map[string]int64                 // countMu：按日在途预留字节（M1）
-	qVersion     uint64                           // countMu：配额状态版本（限速/跨日变更时递增，M3/M1）
+	qVersion     atomic.Uint64                    // 配额状态版本（限速/跨日变更时递增，M3/M1/A2：旧 token 重校验）
 	seq          uint64                           // countMu
 
 	// 脏桶（dirtyMu，值为该条目最近一次标记时的脏纪元，用于成功后才清除 F2）
@@ -413,9 +413,13 @@ func (e *Engine) Start(ctx context.Context) error {
 	// 构建目标计数对象。
 	for _, rec := range state.Targets {
 		host := normalizeHost(rec.URL)
+		gen := uint64(1)
+		if rec.Generation > 0 {
+			gen = rec.Generation
+		}
 		t := &target{
 			id:               rec.ID,
-			gen:              1,
+			gen:              gen,
 			host:            host,
 			total:           new(atomic.Int64),
 			name:            rec.Name,
@@ -1013,26 +1017,31 @@ func (e *Engine) doRequest(ctx context.Context, t *target, gen uint64, kind requ
 			req.Header.Set("Range", rangeSpec)
 		}
 
-		// R4：网络计时从实际发请求起算；探活逐跳用独立的 10s 网络超时（不把本地等待耗进网络时限）。
+		// R4/A3：网络计时从实际发请求起算；探活逐跳用独立的 10s 网络窗口，cancel 所有权随 Body.Close
+		// 转移（请求 ctx 与 body 读取同属一段网络期限，不独立失效）。
 		sendCtx := ctx
-		var scancel context.CancelFunc
+		var netCancel context.CancelFunc
 		if kind == kindProbe {
-			sendCtx, scancel = context.WithTimeout(ctx, probeTimeout)
+			sendCtx, netCancel = context.WithTimeout(ctx, probeTimeout)
 		}
 		start := e.clock.Now()
 		resp, derr := e.httpClient.Do(req.WithContext(sendCtx))
-		if scancel != nil {
-			scancel()
-		}
 		latency = int(e.clock.Now().Sub(start).Milliseconds())
 		if derr != nil {
+			if netCancel != nil {
+				netCancel()
+			}
 			e.releaseHeldHost(&heldHost)
 			return nil, "", latency, derr
+		}
+		if kind == kindProbe && netCancel != nil {
+			// 探活：把 cancel 所有权挂到 Body；调用方在 body 处理结束/关闭时结束本跳网络窗口。
+			resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: netCancel}
 		}
 
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 && resp.StatusCode != 304 {
 			loc := resp.Header.Get("Location")
-			_ = resp.Body.Close()
+			_ = resp.Body.Close() // 结束本跳网络窗口（A3），下一跳新建
 			e.releaseHeldHost(&heldHost) // 释放旧 host 许可（规则 3），幂等清空（R1）
 			if loc == "" {
 				return nil, "", latency, fmt.Errorf("redirect without location (status %d)", resp.StatusCode)
@@ -1116,6 +1125,20 @@ func (e *Engine) cooldownHoursOf() time.Duration {
 	e.stateMu.RLock()
 	defer e.stateMu.RUnlock()
 	return time.Duration(e.cooldownHours) * time.Hour
+}
+
+// cancelOnCloseBody 把网络窗口的 cancel 所有权随 Body.Close 转移（A3）：读体完成/关闭后才 cancel。
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnCloseBody) Close() error {
+	err := b.ReadCloser.Close()
+	if b.cancel != nil {
+		b.cancel()
+	}
+	return err
 }
 
 // dest 表示存储目标（规则 16）。
@@ -1264,6 +1287,11 @@ func (e *Engine) readLoop(ctx context.Context, t *target, gen uint64, body io.Re
 		}
 		// M1：Read 前按日预留 min(读长, 剩余额度)；amount==0=配额触达。
 		tok := e.quotaReserve(int64(len(buf)))
+		// A2：旧版本 token（限额/跨日切换后）在 Read 前失效重校验：释放旧预留并重按当前预算预约。
+		for tok.amount != 0 && tok.version != e.quotaVersion() {
+			e.releaseTokenBooking(tok)
+			tok = e.quotaReserve(int64(len(buf)))
+		}
 		if tok.amount == 0 {
 			return errQuotaReached
 		}
@@ -1329,7 +1357,7 @@ func (e *Engine) quotaReserve(n int64) quotaToken {
 	e.ensureDay(day, now) // 跨日重绑预算（F5）
 	limit := e.dailyLimit.Load()
 	if limit <= 0 {
-		return quotaToken{amount: n, day: day, version: e.qVersion} // 不限：不预留、结算不退他人预留（R3）
+		return quotaToken{amount: n, day: day, version: e.qVersion.Load()} // 不限：不预留、结算不退他人预留（R3）
 	}
 	used := int64(0)
 	if g := e.globalDays[day]; g != nil {
@@ -1340,18 +1368,18 @@ func (e *Engine) quotaReserve(n int64) quotaToken {
 	if used >= limit {
 		e.blockedFlag.Store(1)
 		e.notify.signal()
-		return quotaToken{day: day, version: e.qVersion}
+		return quotaToken{day: day, version: e.qVersion.Load()}
 	}
 	avail := limit - used - reservedNow
 	if avail <= 0 {
-		return quotaToken{day: day, version: e.qVersion} // 预算暂满：新预留 0，但不取消合法持有者
+		return quotaToken{day: day, version: e.qVersion.Load()} // 预算暂满：新预留 0，但不取消合法持有者
 	}
 	take := n
 	if take > avail {
 		take = avail
 	}
 	e.reserved[day] = reservedNow + take
-	return quotaToken{amount: take, day: day, version: e.qVersion, booked: true}
+	return quotaToken{amount: take, day: day, version: e.qVersion.Load(), booked: true}
 }
 
 // bucketBytes 在 countMu 内把 n 字节归属到当前日/小时桶（M1 结算的一部分，不重取锁）。
@@ -1412,6 +1440,24 @@ func (e *Engine) settleRead(tok quotaToken, t *target, rn int64) {
 }
 
 // countBytes 在计数协调锁内把读取字节归属到日/小时桶（无配额预留场景，规则 9；M1 实际消费基准）。
+// quotaVersion 返回当前配额状态版本（A2：旧 token 重校验用）。
+func (e *Engine) quotaVersion() uint64 { return e.qVersion.Load() }
+
+// releaseTokenBooking 释放令牌的预留（若 booked），供旧版本令牌失效后归还预算。
+func (e *Engine) releaseTokenBooking(tok quotaToken) {
+	if !tok.booked || tok.amount <= 0 {
+		return
+	}
+	e.countMu.Lock()
+	cur := e.reserved[tok.day]
+	rel := tok.amount
+	if rel > cur {
+		rel = cur
+	}
+	e.reserved[tok.day] = cur - rel
+	e.countMu.Unlock()
+}
+
 func (e *Engine) countBytes(t *target, n int64) {
 	if n <= 0 {
 		return
@@ -1447,7 +1493,7 @@ func (e *Engine) ensureDay(day string, now time.Time) {
 		return
 	}
 	e.currentDay = day
-	e.qVersion++ // 旧预留令牌版本失效
+	e.qVersion.Add(1) // 旧预留令牌版本失效
 	e.recomputeGateLockedQuota()
 }
 
@@ -1581,8 +1627,10 @@ func isPermanentPersistErr(err error) bool {
 // 临界区内连同 dirtyMu 快照脏集合与读取全部计数值（target total + 日/全局/小时桶），使脏集合
 // 选择与数值处于同一一致性版本；锁序为 stateMu → countMu→dirtyMu（非反向嵌套）。
 func (e *Engine) buildBatch() (*CounterBatch, *dirtySnap) {
-	// 1) stateMu：抓全部目标指针与健康（指针后续在 countMu 下读 atomic total 安全）。
+	// A1：stateMu.RLock 跨 countMu→dirtyMu 全程持有，使健康快照、dirty 纪元与全部计数/健康值
+	// 处于同一一致性版本；逆序释放（dirtyMu→countMu→stateMu）。锁序 stateMu→countMu→dirtyMu。
 	e.stateMu.RLock()
+	defer e.stateMu.RUnlock()
 	type ptrHealth struct {
 		t *target
 		h TargetHealthPersist
@@ -1596,9 +1644,9 @@ func (e *Engine) buildBatch() (*CounterBatch, *dirtySnap) {
 			LatencyMS:         t.latencyMS,
 			ErrorMsg:          t.errorMsg,
 			ConsecutiveErrors: t.consecutiveErrors,
+			Generation:        t.gen, // A1：快照代际供 PersistBatch 屏障
 		}}
 	}
-	e.stateMu.RUnlock()
 
 	batch := &CounterBatch{
 		TargetDays:   make(map[string]map[int64]int64),
@@ -1608,7 +1656,7 @@ func (e *Engine) buildBatch() (*CounterBatch, *dirtySnap) {
 		TargetHealth: make(map[int64]TargetHealthPersist),
 	}
 
-	// 2) countMu 临界区：快照脏集合（dirtyMu 为叶，countMu→dirtyMu 声明序）+ 读全部计数绝对值（同版本）。
+	// 在 stateMu.RLock 覆盖期内取 countMu，再于 countMu 内取 dirtyMu（声明序，非反向嵌套）。
 	e.countMu.Lock()
 	snap := e.snapshotDirty() // 在 countMu 内取 dirtyMu
 	if len(snap.days) == 0 && len(snap.glob) == 0 && len(snap.hours) == 0 && len(snap.targets) == 0 {
@@ -1654,7 +1702,6 @@ func (e *Engine) buildBatch() (*CounterBatch, *dirtySnap) {
 		}
 	}
 	e.countMu.Unlock()
-
 	return batch, snap
 }
 
@@ -2070,18 +2117,15 @@ func (e *Engine) probeOne(id int64) {
 		return
 	}
 
-	// 探活字节计入统计与限速（规则 12）；body 读取用独立 10s 网络窗口（R4：网络计时持续到 body 处理结束）。
-	readCtx, readCancel := context.WithTimeout(pctx, probeTimeout)
-	if err := e.probeRead(readCtx, t, resp.Body); err != nil {
-		readCancel()
-		readCancel()
+	// 探活字节计入统计与限速（规则 12）。A3：body 读取由 resp.Body 内携带的网络窗口（10s，随 Close 结束）
+	// 约束，与请求 ctx 同属一段网络期限；probeRead 的限速等待用总轮次预算 roundCtx。
+	if err := e.probeRead(roundCtx, t, resp.Body); err != nil {
 		if e.probeNotRemoteFault(err) {
 			return
 		}
 		e.onProbeTransportError(t, gen, err, latency)
 		return
 	}
-	readCancel()
 
 	if status == http.StatusOK || status == http.StatusPartialContent {
 		e.onProbeHealthy(t, gen, status, latency)
@@ -2112,6 +2156,11 @@ func (e *Engine) probeRead(ctx context.Context, t *target, body io.Reader) error
 	buf := make([]byte, probeRange)
 	// M1：探活同样按日预留-结算-退还。
 	tok := e.quotaReserve(int64(len(buf)))
+	// A2：旧版本 token 在 Read 前失效重校验。
+	for tok.amount != 0 && tok.version != e.quotaVersion() {
+		e.releaseTokenBooking(tok)
+		tok = e.quotaReserve(int64(len(buf)))
+	}
 	if tok.amount == 0 {
 		return nil // 配额触达，本次探活不读字节（不影响健康）
 	}
@@ -2445,7 +2494,7 @@ func (e *Engine) SetDailyLimit(gb float64) error {
 // setDailyLimitBytes 在 countMu 内更新每日字节上限，并递增配额状态版本（M1：0↔finite 热切换重建账本）。
 func (e *Engine) setDailyLimitBytes(b int64) {
 	e.countMu.Lock()
-	e.qVersion++
+	e.qVersion.Add(1)
 	e.dailyLimit.Store(b)
 	e.countMu.Unlock()
 }
