@@ -2,7 +2,7 @@
 
 > 协调者：Claude Code（常驻）。本文件是所有 worker 的**唯一契约来源**，与 `docs/SPEC.md`（需求规格）配套。
 > 任何与 SPEC 冲突之处以 SPEC 为准，除非 PLAN 中标注为"协调者决策"。
-> **版本：v3** —— T1 审查（REJECT：4B+11M+1m）全面修订为 v2；T1b 聚焦复审（10 项落实/6 项部分，R1-R5 阻断）修订为 v3：累计口径统一、CounterBatch/恢复接口闭合、跨日独立于刷盘、探活资格矩阵、引擎接管 CRUD、历史权威视图、验证与错误表补全、软删唯一索引。D1-D6 获两轮同意。
+> **版本：v3.1** —— T1（4B+11M+1m）→v2；T1b（R1-R8）→v3；T1c（B1 DTO 内联回归、B2 ApplyConfigUpdate 事务入口、M1-M3 文本修订）→v3.1。D1-D7 获三轮同意。
 
 ## 0. 角色分工与额度策略
 
@@ -87,12 +87,12 @@ func ValidateStorageMode(v string) error
 func ValidateMaxRateMbps(v int) error      // >=0
 func ValidateMaxConnections(v int) error   // 1-10
 func ValidateDailyLimitGB(v float64) error // 有限非负
-func ValidateSchedule(s ScheduleConfig) error // start==end 非法；end 仅可 24
+func ValidateSchedule(s ScheduleConfig) error // start==end 非法；end 范围 0-24、24 只能用于 end（M3）
 func ValidateJitter(j JitterConfig) error  // 0<=Min<=Max
 func ValidateTargetInput(name, url string, weight int) error
 ```
 
-**presence 语义**：YAML 缺字段才填默认；显式 `false`/`0`/`1` 原样保留（指针 raw 结构或 yaml.Node presence）。LoadConfig 必须跑全部验证（含 jitter 与 cooldown_hours）。
+**presence 语义**：YAML 缺字段才填默认（StorageMode 默认 `discard`、UserAgent 默认桌面 Chrome UA——普通下载与探活同样携带配置 UA）；显式 `false`/`0`/`1` 原样保留（指针 raw 结构或 yaml.Node presence）。LoadConfig 必须跑全部验证（含 jitter 与 cooldown_hours）。
 
 **schedule 语义**：`[start_hour, end_hour)`；`start<end`：`start<=h<end`；`start>end` 跨夜：`h>=start || h<end`；本地钟点判断。
 
@@ -196,9 +196,42 @@ func (e *Engine) History24h(now time.Time) ([]HistoryPoint, error) // R6 内存�
 func (e *Engine) CreateTarget(p TargetPatch) (TargetRecord, error)
 func (e *Engine) PatchTarget(id int64, p TargetPatch) (TargetRecord, error)
 func (e *Engine) DeleteTarget(id int64) error
+// 控制事务入口（B2）：main 的热更新必须走此单一方法，不得自行拼 Save+setter
+func (e *Engine) ApplyConfigUpdate(candidate *Config, persist func() error) error
 ```
 
-EngineSnapshot / TargetSnapshot 同 v2（json 标签不变；`TotalBytes`=全量累计含今日 R1；`CooldownRemainingSeconds=max(0,ceil((cooldown_until-snapshot_now)/1s))`）。
+**EngineSnapshot / TargetSnapshot 完整定义（B1 内联，json 标签为冻结契约）**：
+```go
+type TargetSnapshot struct {
+    ID    int64  `json:"id"`
+    Name  string `json:"name"`
+    URL   string `json:"url"`
+    Weight int   `json:"weight"`
+    Enabled bool `json:"enabled"`
+    Health string `json:"health"`   // "Healthy"|"RateLimited"|"Dead"|"Unknown"
+    LatencyMS int64 `json:"latency_ms"` // 请求发出至收到响应头的耗时 ms；无检测=0
+    CooldownRemainingSeconds int64 `json:"cooldown_remaining_seconds"` // max(0,ceil((cooldown_until-snapshot_now)/1s))
+    TodayBytes  int64 `json:"today_bytes"`  // 当日桶绝对值
+    TotalBytes  int64 `json:"total_bytes"`  // 全量累计绝对值（含今日，R1）
+    SpeedMbps   float64 `json:"speed_mbps"`
+    SpeedMBPerSec float64 `json:"speed_mb_per_sec"`
+    ErrorMsg    string `json:"error_msg"`
+}
+type EngineSnapshot struct {
+    Status string `json:"status"`       // running|paused|sleeping_schedule|quota_reached
+    StorageMode string `json:"storage_mode"`
+    MaxRateMbps int `json:"max_rate_mbps"`
+    MaxConnections int `json:"max_connections"`
+    ActiveConnections int `json:"active_connections"`
+    SpeedMbps float64 `json:"speed_mbps"`
+    SpeedMBPerSec float64 `json:"speed_mb_per_sec"`
+    TodayBytes int64 `json:"today_bytes"`
+    DailyLimitGB float64 `json:"daily_limit_gb"`
+    Schedule ScheduleConfig `json:"schedule"`
+    Targets []TargetSnapshot `json:"-"`  // /api/targets 单独序列化
+    SnapshotAt time.Time `json:"-"`
+}
+```
 
 规则（逐条落实，编号供审查对照）：
 1. **准入矩阵（R4）**：共用目标互斥/host 锁/冷却检查，但按请求种类区分资格——**下载**：仅 `enabled 且 Healthy`；**探活**（定时/手动）：允许所有未软删且**不在未到期冷却**的目标（含 disabled、Unknown、Dead、已过期 RateLimited）。`now<cooldown_until` 一切请求禁止。每个请求发起前重查 tombstone/generation/冷却/资格。
@@ -213,7 +246,7 @@ EngineSnapshot / TargetSnapshot 同 v2（json 标签不变；`TotalBytes`=全量
 10. **刷盘管线**：唯一持久化协程，10s 一批不可变 CounterBatch（含所有脏桶+绝对值）；失败重试同批；Seq 顺序；Stop 最终批；403/429 紧急批走同一管线并等待结果。
 11. **跨日切换（R3）**：午夜在计数协调锁内**立即**切换配额视图（新日桶键生效、解除 quota_reached），**不等刷盘**；旧日脏桶保留在 TargetDays/GlobalDays 异步重试，不阻塞新日；全局 today 从独立全局日桶维护恢复（GlobalDays），删节点不减全局。
 12. **探活（R4）**：启动立即探 Unknown；15min+手动（同轮合并、并发受控、单请求超时 10s）；请求 `GET` + `Range: bytes=0-1023` + 配置 UA；**最多读 1024 字节**（200 也如此，不 drain）；探活字节计入统计与限速；已过期 RateLimited 进入待探活队列，**成功才恢复下载**。
-13. **健康状态机（R4）**：403/429（下载或探活）→ RateLimited + cooldown_until=now+cooldown_hours，立即经管线提交紧急批，取消该目标在途；探活 200/206 → Unknown/Dead/Healthy/已过期 RateLimited 全部置 Healthy、清零错误计数；探活其他非 200/206 状态（除 403/429）→ 记录状态码、**探活失败置 Dead**；下载 404/超时/reset/5xx → consecutive_errors+1，连续 3 → Dead；下载成功 → 重置计数。写回健康前比对 generation 与既有 cooldown_until（旧结果不得覆盖新冷却）。
+13. **健康状态机（R4）**：403/429（下载或探活）→ RateLimited + cooldown_until=now+cooldown_hours，立即经管线提交紧急批，取消该目标在途；探活 200/206 → Unknown/Dead/Healthy/已过期 RateLimited 全部置 Healthy、清零错误计数；探活其他非 200/206 状态（除 403/429）→ 记录状态码、**探活失败置 Dead**；**探活超时、连接重置及其他传输/读取错误同样置 Dead 并记录 error_msg；因 Stop/CRUD/门禁导致的 context 取消不计远端故障；未到期冷却不得被取消或错误结果覆盖**（M1）；下载 404/超时/reset/5xx → consecutive_errors+1，连续 3 → Dead；下载成功 → 重置计数。写回健康前比对 generation 与既有 cooldown_until（旧结果不得覆盖新冷却）。`latency_ms` = 请求发出至收到响应头的耗时（探活与下载同口径），无检测=0。
 14. **速率采样**：唯一协程 500ms 采样永不清零累计值；按稳定 target id 环形缓冲；实际时间差 ≤3s 窗口；<2 样本=0；3s 无增量=0；发布 mutex/atomic pointer；Snapshot 深拷贝；全局速率独立累计；删节点不减全局。
 15. **目标 CRUD（R5）**：由 Engine 串行管理（与 Stop/控制共用管理门禁）：先验证/合并候选 → 需要时停准入、取消在途、等待结算并提交计数批 → 调 Store 提交 CRUD → 发布元数据；**DB 失败恢复旧目标准入与元数据（已发生流量保留）**；创建立即建立 Unknown 计数对象并触发探活；改 URL 递增 generation、保留 id 与历史统计、清空旧健康状态并立即探活（旧 generation 结果丢弃）；改名/权重不重建计数器；禁用=停准入+取消在途+结算（计数保留）；删除=软删+停准入+结算，历史桶保留；稳定 id 计数对象，重载只改元数据不重置计数与采样环。
 16. **存储模式**：请求开始捕获策略；统一 StatsReader+32KiB 显式循环（不用 io.CopyBuffer）；memory：CreateTemp+成功/出错/取消均 Close+Remove；disk：basename 清洗+CreateTemp 唯一+`.part`→成功改名；"零磁盘 I/O"指下载载荷；discard 验收 RSS<30MB。
@@ -238,7 +271,7 @@ EngineSnapshot / TargetSnapshot 同 v2（json 标签不变；`TotalBytes`=全量
 - JSON 规则：错误一律 `{"error":"..."}`；405 带 `Allow`；未匹配 `/api/*` 返回 JSON 404 不回落首页；`id` 正 int64；计数非负 int64；`hour` RFC3339 带本地偏移。
 - **targets CRUD**：handler 调 **Engine** 的 CreateTarget/PatchTarget/DeleteTarget（不直接碰 Store），映射 ErrDuplicateURL→409、ErrNotFound→404、验证失败→400、其他→500。
 - POST 输入四字段必填；PUT 指针语义（缺失=不改、显式 null=400、空对象=400）；URL 须 http/https+有效 hostname+无 userinfo；修改值复用 POST 验证。
-- **POST /api/control**：`{"action":"pause"|"resume"}` 或 `{"action":"update", ...参数任意子集}`（未知字段/非法值 400）。**事务边界**：main 串行化控制更新并与 Engine.Stop 共用管理门禁（Save 后的已验证更新不会因并发 Stop 失效）——构造候选 Config → 统一验证+预检存储目录 → 原子 Save 成功 → 发布快照+执行不会失败的引擎热更新；Save 失败运行态不变+500。
+- **POST /api/control**：`{"action":"pause"|"resume"}` 或 `{"action":"update", "max_rate_mbps"?, "max_connections"?, "daily_limit_gb"?, "storage_mode"?}`（四个允许字段任意子集；未知字段/非法值 400）。**事务边界（B2）**：main 构造候选 Config 副本后调用 `Engine.ApplyConfigUpdate(candidate, func() error { return candidate.Save(configPath) })`——该方法内部获取与 Stop/CRUD **同一管理门禁**，确认未停止，完成全部验证与存储目录预检，再调用 persist（Save 失败不改运行态）；成功后在同一门禁内发布完整配置并执行不会失败的更新。main **不得**将 Save 与多个 setter 自行拼成更新事务；原 setter 保留供测试/内部调用；ApplyConfigUpdate 不得递归获取同一锁。
 - **main 组装**：`-config` 解析 → 配置缺失建父目录复制示例（不覆盖）→ LoadConfig → OpenStore+InitSchema+EnsureSeeded → NewEngine+Start（引擎经 LoadEngineState 恢复计数/健康/冷却/24h 桶）→ HTTP Serve → SIGTERM/SIGINT：停接入 → 等待 handler → Engine.Stop()（内含最终 flush）→ Store.Close；失败非零退出。
 - **web/index.html**：SPEC §4.2 布局 + UI 规则：`daily_limit_gb=0`→"不限量"无进度百分比；Unknown 灰灯单独呈现；控件失败回滚+toast；409 表单内联提示；2s 轮询；history 60s/CRUD 后刷新；离线横幅+自动恢复；字节自适应格式化；冷却剩余人性化；error_msg 悬停；`?demo=1` 演示模式。
 
@@ -251,9 +284,9 @@ EngineSnapshot / TargetSnapshot 同 v2（json 标签不变；`TotalBytes`=全量
 
 ## 8. 验收清单
 
-**T5 自带测试**：schema 幂等；播种仅首次+软删不复活；CRUD 错误值；部分唯一索引（软删后同 URL 可重加、新 id、旧历史保留）；PersistBatch 幂等重放+Seq 拒绝旧批/同批重试成功；LoadEngineState 恢复（含 last_seq、今日桶、全局日桶、24h 桶）；History24h 补零边界。`go test -race` 必过。
+**T5 自带测试**：schema 幂等；播种仅首次+软删不复活；CRUD 错误值；部分唯一索引（软删后同 URL 可重加、新 id、旧历史保留）；PersistBatch 幂等重放+Seq 拒绝旧批/同批重试成功；**LoadEngineState 的 24h 桶恢复**（含 last_seq、今日桶、全局日桶）。`go test -race` 必过。
 
-**T7 自带测试**（§8 清单 10 项，可注入时钟+httptest，`-race` 必过）：2→1→2 伸缩对账；重定向同 host 互斥；探活/下载并发无脏写；403 后全入口零请求（含探活——准入矩阵）；3 次熔断+探活恢复（含 Dead 探活资格）；限速热切换即时生效；暂停/配额在途取消+许可回收；午夜/小时边界桶归属正确（刷盘故障不阻塞跨日）；刷盘失败重试同批+紧急批（403 冷却持久化）+退出最终批；discard RSS<30MB 实测。另：CRUD 引擎接管路径（停准入→结算→DB 失败回滚→流量保留）；History24h 权威视图与 DST。
+**T7 自带测试**（§8 清单 10 项，可注入时钟+httptest，`-race` 必过）：2→1→2 伸缩对账；重定向同 host 互斥；探活/下载并发无脏写；403 后全入口零请求（含探活——准入矩阵）；3 次熔断+探活恢复（含 Dead 探活资格）；限速热切换即时生效；暂停/配额在途取消+许可回收；午夜/小时边界桶归属正确（刷盘故障不阻塞跨日）；刷盘失败重试同批+紧急批（403 冷却持久化）+退出最终批；discard RSS<30MB 实测。另：CRUD 引擎接管路径（停准入→结算→DB 失败回滚→流量保留）；**Engine.History24h 补零、排序及 DST 边界**（M2）。
 
 **T10 集成冒烟**：全部方法+错误码（400/404/405+Allow/409/500）；PUT enabled=false 显式生效；rate=0 保留；control 持久化失败运行态不变；删除/改 URL 重启不复活、历史保留、generation 隔离；403 冷却重启仍生效；/api/history 引擎权威视图；前端加载/轮询/demo/回滚。
 

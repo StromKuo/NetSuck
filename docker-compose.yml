@@ -1,0 +1,22 @@
+services:
+  netsuck:
+    image: ghcr.io/stromkuo/netsuck:latest
+    container_name: netsuck
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # 持久化目录：用于存放运行时配置文件 config.yaml 与 SQLite 统计数据库 stats.db
+      - ./data:/data
+    # 可选 tmpfs 内存盘配置：
+    # 当在 config.yaml 或 Web 面板中启用 storage_mode: memory 模式时，
+    # 程序会将下载数据写入 memory_dir（默认 /tmp/dl_cache）并在完成后立即删除。
+    # 【特别注意】：若启用 memory 模式，必须为 tmpfs 显式设置大小上限（如 size=2g）！
+    # 否则 tmpfs 默认可能无限制占用宿主机物理内存（最高可达 50% 内存），在高并发或
+    # 遇特大文件时极易耗尽系统内存导致宿主机 OOM。
+    # 如果没有特殊落盘/缓存验证需求，强烈推荐保持默认的 discard 模式（零磁盘 I/O，内存稳定 < 30MB）。
+    # tmpfs:
+    #   - /tmp/dl_cache:size=2g
+    environment:
+      # 时区配置：确保每日流量配额清零（每天 00:00）及活跃时间段（schedule）判定严格遵照本地时间
+      - TZ=Asia/Shanghai

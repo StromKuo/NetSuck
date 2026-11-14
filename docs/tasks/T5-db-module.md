@@ -16,7 +16,7 @@
 - `Close`
 - **写入串行化**：Store 内单把写互斥；WAL 模式下读并发安全
 
-`db_test.go`：临时目录建库，覆盖：schema 幂等、播种仅首次（含删除后重启不复活——mock：seed 后 SoftDelete 再 EnsureSeeded 不复活）、CRUD 与错误值（ErrDuplicateURL/ErrNotFound）、PersistBatch 幂等（同批重放结果一致）与 Seq 拒绝旧批、History24h 跨小时补零与边界。`go test ./... -race` 必须通过。
+`db_test.go`：临时目录建库，覆盖：schema 幂等、播种仅首次（含删除后重启不复活——mock：seed 后 SoftDelete 再 EnsureSeeded 不复活）、CRUD 与错误值（ErrDuplicateURL/ErrNotFound）、**部分唯一索引（软删后同 URL 可重加、新 id、旧历史保留）**、PersistBatch 幂等（同批重放结果一致）与 Seq 拒绝旧批/同批重试成功、**LoadEngineState 的 24h 桶恢复**（含 last_seq、今日桶、全局日桶）。`go test ./... -race` 必须通过。
 
 ## 验证（报告附输出）
 ```bash
