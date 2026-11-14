@@ -1,0 +1,1564 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="h-full">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NetSuck - Web 监控面板</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#eef2ff',
+              100: '#e0e7ff',
+              500: '#6366f1',
+              600: '#4f46e5',
+              700: '#4338ca',
+            }
+          }
+        }
+      }
+    };
+    function applyTheme() {
+      if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        document.documentElement.classList.add('dark');
+      } else {
+        document.documentElement.classList.remove('dark');
+      }
+    }
+    applyTheme();
+    if (window.matchMedia) {
+      window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
+    }
+  </script>
+  <style>
+    /* 进度条动画与平滑效果 */
+    .progress-bar-transition {
+      transition: width 0.5s ease-in-out;
+    }
+    /* 隐藏 Chrome, Safari, Edge, Opera 针对数字输入框的默认箭头 */
+    input::-webkit-outer-spin-button,
+    input::-webkit-inner-spin-button {
+      -webkit-appearance: none;
+      margin: 0;
+    }
+    input[type=number] {
+      -moz-appearance: textfield;
+    }
+  </style>
+</head>
+<body class="h-full bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-100 font-sans antialiased flex flex-col transition-colors duration-200">
+
+  <!-- 离线告警横幅 -->
+  <div id="offlineBanner" class="hidden bg-amber-500 text-white px-4 py-2.5 shadow-md flex items-center justify-center gap-2 text-sm font-medium z-50 sticky top-0 transition-all">
+    <svg class="w-5 h-5 flex-shrink-0 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+    </svg>
+    <span>后端服务连接失败，正在尝试自动重连...</span>
+  </div>
+
+  <!-- 顶部导航栏 / 品牌栏 -->
+  <header class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 shadow-sm sticky top-0 z-30">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+      <!-- 品牌标识与标语 -->
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 to-indigo-400 flex items-center justify-center text-white shadow-md shadow-indigo-500/20">
+          <!-- 吸取/涡流/下载网络内联 SVG 图标 -->
+          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+          </svg>
+        </div>
+        <div>
+          <div class="flex items-center gap-2">
+            <h1 class="text-xl font-bold tracking-tight bg-gradient-to-r from-indigo-600 to-violet-600 dark:from-indigo-400 dark:to-violet-400 bg-clip-text text-transparent">
+              NetSuck
+            </h1>
+            <!-- DEMO 徽标（在 demo 模式下显示） -->
+            <span id="demoBadge" class="hidden px-2 py-0.5 text-xs font-semibold rounded-full bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300 border border-amber-300 dark:border-amber-700 items-center gap-1">
+              <span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-ping"></span>
+              DEMO 演示模式
+            </span>
+          </div>
+          <p class="text-xs text-slate-500 dark:text-slate-400 italic font-mono hidden sm:block">
+            "Because asymmetrical throttling sucks."
+          </p>
+        </div>
+      </div>
+
+      <!-- 右侧信息栏：时钟 & 活跃时段 & 连接指示灯 -->
+      <div class="flex items-center gap-3 sm:gap-6 text-xs text-slate-600 dark:text-slate-300">
+        <div class="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-700/60 border border-slate-200 dark:border-slate-600">
+          <svg class="w-4 h-4 text-slate-500 dark:text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+          </svg>
+          <span>活跃时段: <strong id="headerScheduleText" class="font-medium text-slate-800 dark:text-slate-100">--:00 ~ --:00</strong></span>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <span id="onlineDot" class="w-2.5 h-2.5 rounded-full bg-emerald-500 ring-4 ring-emerald-500/20"></span>
+          <span id="onlineText" class="font-medium hidden sm:inline">服务在线</span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- 主体内容区域 -->
+  <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6 flex-1 w-full">
+
+    <!-- 三张核心概览卡片 -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+
+      <!-- 卡片 1：全局实时速率与引擎控制 -->
+      <div class="bg-white dark:bg-slate-800 rounded-2xl p-5 border border-slate-200/80 dark:border-slate-700 shadow-sm relative overflow-hidden flex flex-col justify-between">
+        <div>
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">全局下行速率</span>
+            <!-- 引擎运行状态徽标 -->
+            <div id="engineStatusBadge" class="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-50 dark:bg-emerald-950/50 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800">
+              <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+              <span id="engineStatusText">running</span>
+            </div>
+          </div>
+
+          <div class="mt-4 flex items-baseline gap-2">
+            <span id="globalSpeedMbps" class="text-4xl font-extrabold tracking-tight font-mono text-indigo-600 dark:text-indigo-400">0.0</span>
+            <span class="text-base font-semibold text-slate-500 dark:text-slate-400">Mbps</span>
+          </div>
+          <div class="mt-1 text-sm font-medium text-slate-500 dark:text-slate-400 font-mono">
+            ≈ <span id="globalSpeedMBps">0.00</span> MB/s
+          </div>
+        </div>
+
+        <div class="mt-5 pt-4 border-t border-slate-100 dark:border-slate-700/60 flex items-center justify-between">
+          <div class="text-xs text-slate-500 dark:text-slate-400">
+            活跃连接: <span id="activeConnCount" class="font-bold text-slate-700 dark:text-slate-200">0</span> / <span id="maxConnDisplay">2</span>
+          </div>
+          <!-- 一键暂停 / 恢复按钮 -->
+          <button id="toggleEngineBtn" onclick="handleToggleEngine()" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg shadow-sm transition-all text-white bg-amber-500 hover:bg-amber-600 active:scale-95 disabled:opacity-50">
+            <svg id="toggleEngineIcon" class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            </svg>
+            <span id="toggleEngineLabel">暂停引擎</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- 卡片 2：今日已刷流量与配额进度条 -->
+      <div class="bg-white dark:bg-slate-800 rounded-2xl p-5 border border-slate-200/80 dark:border-slate-700 shadow-sm relative overflow-hidden flex flex-col justify-between">
+        <div>
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">今日累计流量</span>
+            <button onclick="openQuotaModal()" class="text-xs text-indigo-600 dark:text-indigo-400 hover:underline inline-flex items-center gap-0.5">
+              <span>设置配额</span>
+              <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/>
+              </svg>
+            </button>
+          </div>
+
+          <div class="mt-4 flex items-baseline gap-2">
+            <span id="todayTrafficGB" class="text-4xl font-extrabold tracking-tight font-mono text-slate-900 dark:text-white">0.00</span>
+            <span class="text-base font-semibold text-slate-500 dark:text-slate-400">GB</span>
+            <span class="text-xs text-slate-400 dark:text-slate-500">/ <span id="dailyLimitText">300 GB</span></span>
+          </div>
+          <div class="mt-1 text-xs text-slate-500 dark:text-slate-400 font-mono">
+            总计: <span id="todayTrafficExact">0 B</span>
+          </div>
+        </div>
+
+        <!-- 可点击快捷修改配额的进度条 -->
+        <div class="mt-5 pt-4 border-t border-slate-100 dark:border-slate-700/60">
+          <div class="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 mb-1.5">
+            <span>已使用配额</span>
+            <span id="quotaPercentText" class="font-bold text-slate-700 dark:text-slate-200">0.0%</span>
+          </div>
+          <div onclick="openQuotaModal()" title="点击快捷修改每日流量上限" class="w-full bg-slate-100 dark:bg-slate-700/80 rounded-full h-3 cursor-pointer overflow-hidden p-0.5 border border-slate-200 dark:border-slate-600 group relative">
+            <div id="quotaProgressBar" class="bg-indigo-600 dark:bg-indigo-500 h-2 rounded-full progress-bar-transition group-hover:brightness-110" style="width: 0%"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 卡片 3：网络限速与策略设置 -->
+      <div class="bg-white dark:bg-slate-800 rounded-2xl p-5 border border-slate-200/80 dark:border-slate-700 shadow-sm relative overflow-hidden flex flex-col justify-between">
+        <div>
+          <span class="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider block mb-3">运行时策略控制</span>
+
+          <div class="space-y-3">
+            <!-- 全局限速 (Mbps) -->
+            <div class="flex items-center justify-between gap-2">
+              <label for="maxRateInput" class="text-xs text-slate-600 dark:text-slate-300 font-medium">全局限速 (Mbps):</label>
+              <div class="flex items-center gap-1.5">
+                <input id="maxRateInput" type="number" min="0" step="1" placeholder="0不限速" class="w-20 px-2 py-1 text-xs font-mono text-center rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 focus:outline-none focus:ring-1 focus:ring-indigo-500">
+                <button id="saveRateBtn" onclick="saveMaxRate()" class="px-2 py-1 text-xs rounded-lg bg-slate-100 dark:bg-slate-700 hover:bg-indigo-50 hover:text-indigo-600 dark:hover:bg-slate-600 border border-slate-300 dark:border-slate-600 transition">保存</button>
+              </div>
+            </div>
+
+            <!-- 最大并发连接数 (1-10) 步进器 -->
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-xs text-slate-600 dark:text-slate-300 font-medium">最大并发连接 (1-10):</span>
+              <div class="flex items-center rounded-lg border border-slate-300 dark:border-slate-600 bg-slate-50 dark:bg-slate-900 overflow-hidden">
+                <button onclick="stepConnections(-1)" class="px-2 py-1 text-xs font-bold text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800 transition">-</button>
+                <input id="maxConnInput" type="number" min="1" max="10" readonly class="w-8 py-1 text-xs font-mono font-bold text-center bg-transparent border-0 focus:outline-none">
+                <button onclick="stepConnections(1)" class="px-2 py-1 text-xs font-bold text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800 transition">+</button>
+              </div>
+            </div>
+
+            <!-- 存储丢弃模式下拉 -->
+            <div class="flex items-center justify-between gap-2">
+              <label for="storageModeSelect" class="text-xs text-slate-600 dark:text-slate-300 font-medium">存储模式:</label>
+              <select id="storageModeSelect" onchange="changeStorageMode(this.value)" class="text-xs px-2 py-1 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 focus:outline-none focus:ring-1 focus:ring-indigo-500 text-slate-800 dark:text-slate-100">
+                <option value="discard">纯内存丢弃 (零I/O)</option>
+                <option value="memory">内存盘 (tmpfs)</option>
+                <option value="disk">硬盘落盘 (disk)</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-4 pt-3 border-t border-slate-100 dark:border-slate-700/60 flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+          <span>活跃时间范围</span>
+          <span id="cardScheduleSpan" class="font-mono font-medium text-slate-700 dark:text-slate-200">00:00 ~ 24:00</span>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- 图表可视化区域（双栏网格） -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+      <!-- 环形图：URL 历史累计流量占比 (占 1 列) -->
+      <div class="bg-white dark:bg-slate-800 rounded-2xl p-5 border border-slate-200/80 dark:border-slate-700 shadow-sm flex flex-col justify-between">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-sm font-bold text-slate-800 dark:text-slate-100 flex items-center gap-2">
+            <svg class="w-4 h-4 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z"/>
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z"/>
+            </svg>
+            各 URL 累计流量占比
+          </h2>
+          <span class="text-xs text-slate-400 dark:text-slate-500">按节点统计</span>
+        </div>
+
+        <div class="relative flex-1 min-h-[220px] flex items-center justify-center">
+          <canvas id="doughnutChart"></canvas>
+          <div id="doughnutEmptyState" class="hidden absolute inset-0 flex flex-col items-center justify-center text-center p-4">
+            <svg class="w-10 h-10 text-slate-300 dark:text-slate-600 mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+            </svg>
+            <p class="text-xs text-slate-400 dark:text-slate-500">暂无累计流量数据</p>
+            <p class="text-[11px] text-slate-400/80 dark:text-slate-600">启动刷流后将自动绘制各节点占比</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- 折线图：过去 24 小时流量走势 (占 2 列) -->
+      <div class="bg-white dark:bg-slate-800 rounded-2xl p-5 border border-slate-200/80 dark:border-slate-700 shadow-sm flex flex-col justify-between lg:col-span-2">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-sm font-bold text-slate-800 dark:text-slate-100 flex items-center gap-2">
+            <svg class="w-4 h-4 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z"/>
+            </svg>
+            24 小时下行流量趋势
+          </h2>
+          <span class="text-xs text-slate-400 dark:text-slate-500">单位：GB / 小时</span>
+        </div>
+
+        <div class="relative flex-1 min-h-[220px]">
+          <canvas id="historyChart"></canvas>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- URL 目标节点表格（核心区块） -->
+    <div class="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200/80 dark:border-slate-700 shadow-sm overflow-hidden">
+      <!-- 头部工具栏 -->
+      <div class="p-4 sm:p-5 border-b border-slate-200 dark:border-slate-700 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 class="text-base font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+            下载目标节点
+            <span id="targetCountBadge" class="px-2 py-0.5 text-xs font-semibold rounded-full bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300">0</span>
+          </h2>
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">配置公共大文件直链，引擎将按权重加权轮询下载并丢弃/保存</p>
+        </div>
+
+        <div class="flex items-center gap-2.5">
+          <!-- 测试全部连通性按钮 -->
+          <button id="checkAllBtn" onclick="triggerCheckAll()" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-600 transition shadow-sm disabled:opacity-50">
+            <svg id="checkAllIcon" class="w-3.5 h-3.5 text-slate-500 dark:text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+            </svg>
+            <span id="checkAllText">测试全部连通性</span>
+          </button>
+
+          <!-- 添加 URL 按钮 -->
+          <button onclick="openAddTargetModal()" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white transition shadow-sm shadow-indigo-500/20 active:scale-95">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+            </svg>
+            <span>添加 URL</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- 表格内容 -->
+      <div class="overflow-x-auto">
+        <table class="w-full text-left border-collapse text-xs">
+          <thead>
+            <tr class="bg-slate-50/75 dark:bg-slate-900/50 border-b border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 font-semibold">
+              <th class="py-3 px-4">节点名称与链接</th>
+              <th class="py-3 px-3">连通状态 / 延迟</th>
+              <th class="py-3 px-3 text-right">实时速率</th>
+              <th class="py-3 px-3 text-right">今日流量</th>
+              <th class="py-3 px-3 text-right">累计流量</th>
+              <th class="py-3 px-3 text-center">权重</th>
+              <th class="py-3 px-3 text-center">启用</th>
+              <th class="py-3 px-4 text-right">操作</th>
+            </tr>
+          </thead>
+          <tbody id="targetsTableBody" class="divide-y divide-slate-100 dark:divide-slate-700/60">
+            <!-- 动态生成行内容 -->
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- 底部 Footer -->
+  <footer class="border-t border-slate-200 dark:border-slate-800 py-4 text-center text-xs text-slate-400 dark:text-slate-500">
+    <div class="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
+      <span>NetSuck v1.0.0 &middot; 零磁盘损耗下行流量平衡工具</span>
+      <a href="https://github.com/StromKuo/NetSuck" target="_blank" rel="noopener noreferrer" class="hover:text-indigo-500 underline transition">
+        GitHub 仓库
+      </a>
+    </div>
+  </footer>
+
+  <!-- ==================== 模态弹窗区 ==================== -->
+
+  <!-- 模态框 1：添加 URL 弹窗 -->
+  <div id="addTargetModal" class="hidden fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="bg-white dark:bg-slate-800 rounded-2xl max-w-md w-full p-6 shadow-xl border border-slate-200 dark:border-slate-700 transition-all transform scale-100">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-base font-bold text-slate-900 dark:text-slate-100">添加下载目标 URL</h3>
+        <button onclick="closeAddTargetModal()" class="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+          </svg>
+        </button>
+      </div>
+
+      <form id="addTargetForm" onsubmit="handleAddTargetSubmit(event)" class="space-y-4 text-xs">
+        <div>
+          <label class="block font-medium text-slate-700 dark:text-slate-300 mb-1">节点名称</label>
+          <input id="addName" type="text" required placeholder="例如：Ubuntu 24.04 ISO (阿里源)" class="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100">
+        </div>
+
+        <div>
+          <label class="block font-medium text-slate-700 dark:text-slate-300 mb-1">目标直链 URL (必须为 http/https)</label>
+          <input id="addUrl" type="url" required placeholder="https://mirrors.aliyun.com/.../file.iso" class="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100">
+        </div>
+
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label class="block font-medium text-slate-700 dark:text-slate-300 mb-1">调度权重 (>=1)</label>
+            <input id="addWeight" type="number" min="1" value="10" required class="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100">
+          </div>
+          <div class="flex items-center pt-5">
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input id="addEnabled" type="checkbox" checked class="w-4 h-4 rounded text-indigo-600 focus:ring-indigo-500 border-slate-300 dark:border-slate-600 dark:bg-slate-900">
+              <span class="font-medium text-slate-700 dark:text-slate-300">默认启用该节点</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="pt-3 border-t border-slate-100 dark:border-slate-700 flex justify-end gap-2">
+          <button type="button" onclick="closeAddTargetModal()" class="px-4 py-2 rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700">取消</button>
+          <button type="submit" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-medium shadow-sm">确认添加</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 模态框 2：编辑 URL 弹窗 -->
+  <div id="editTargetModal" class="hidden fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="bg-white dark:bg-slate-800 rounded-2xl max-w-md w-full p-6 shadow-xl border border-slate-200 dark:border-slate-700 transition-all">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-base font-bold text-slate-900 dark:text-slate-100">编辑目标节点</h3>
+        <button onclick="closeEditTargetModal()" class="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+          </svg>
+        </button>
+      </div>
+
+      <form id="editTargetForm" onsubmit="handleEditTargetSubmit(event)" class="space-y-4 text-xs">
+        <input type="hidden" id="editId">
+        <div>
+          <label class="block font-medium text-slate-700 dark:text-slate-300 mb-1">节点名称</label>
+          <input id="editName" type="text" required class="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100">
+        </div>
+
+        <div>
+          <label class="block font-medium text-slate-700 dark:text-slate-300 mb-1">目标直链 URL</label>
+          <input id="editUrl" type="url" required class="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100">
+        </div>
+
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label class="block font-medium text-slate-700 dark:text-slate-300 mb-1">调度权重 (>=1)</label>
+            <input id="editWeight" type="number" min="1" required class="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100">
+          </div>
+          <div class="flex items-center pt-5">
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input id="editEnabled" type="checkbox" class="w-4 h-4 rounded text-indigo-600 focus:ring-indigo-500 border-slate-300 dark:border-slate-600 dark:bg-slate-900">
+              <span class="font-medium text-slate-700 dark:text-slate-300">启用该节点</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="pt-3 border-t border-slate-100 dark:border-slate-700 flex justify-end gap-2">
+          <button type="button" onclick="closeEditTargetModal()" class="px-4 py-2 rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700">取消</button>
+          <button type="submit" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-medium shadow-sm">保存修改</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 模态框 3：修改每日流量配额弹窗 -->
+  <div id="quotaModal" class="hidden fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="bg-white dark:bg-slate-800 rounded-2xl max-w-sm w-full p-6 shadow-xl border border-slate-200 dark:border-slate-700">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-base font-bold text-slate-900 dark:text-slate-100">修改每日流量配额</h3>
+        <button onclick="closeQuotaModal()" class="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+          </svg>
+        </button>
+      </div>
+
+      <form id="quotaForm" onsubmit="handleQuotaSubmit(event)" class="space-y-4 text-xs">
+        <div>
+          <label class="block font-medium text-slate-700 dark:text-slate-300 mb-1">每日配额上限 (GB，输入 0 表示不限量)</label>
+          <div class="relative">
+            <input id="quotaInput" type="number" step="any" min="0" required placeholder="如 300" class="w-full px-3 py-2 pr-10 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100">
+            <span class="absolute right-3 top-2 text-slate-400 font-medium">GB</span>
+          </div>
+          <p class="text-[11px] text-slate-400 mt-1">当日累计刷流达到配额后自动休眠，次日 00:00 自动清零并恢复。</p>
+        </div>
+
+        <div class="pt-3 border-t border-slate-100 dark:border-slate-700 flex justify-end gap-2">
+          <button type="button" onclick="closeQuotaModal()" class="px-4 py-2 rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700">取消</button>
+          <button type="submit" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-medium shadow-sm">保存配额</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 模态框 4：删除确认弹窗 -->
+  <div id="deleteModal" class="hidden fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="bg-white dark:bg-slate-800 rounded-2xl max-w-sm w-full p-6 shadow-xl border border-slate-200 dark:border-slate-700">
+      <div class="flex items-center gap-3 mb-3 text-red-600 dark:text-red-400">
+        <div class="w-10 h-10 rounded-full bg-red-100 dark:bg-red-950/60 flex items-center justify-center flex-shrink-0">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+          </svg>
+        </div>
+        <div>
+          <h3 class="text-base font-bold text-slate-900 dark:text-slate-100">确认删除节点</h3>
+          <p class="text-xs text-slate-500 dark:text-slate-400">该操作不可逆，将移除对应下载直链。</p>
+        </div>
+      </div>
+
+      <p class="text-xs text-slate-700 dark:text-slate-300 bg-slate-50 dark:bg-slate-900 p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 mb-4 break-all">
+        节点：<strong id="deleteTargetName"></strong>
+      </p>
+
+      <div class="flex justify-end gap-2 text-xs">
+        <button type="button" onclick="closeDeleteModal()" class="px-4 py-2 rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700">取消</button>
+        <button type="button" id="confirmDeleteBtn" onclick="executeDeleteTarget()" class="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white font-medium shadow-sm">确认删除</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 轻量 Toast 浮层容器 -->
+  <div id="toastContainer" class="fixed bottom-5 right-5 z-50 flex flex-col gap-2 pointer-events-none"></div>
+
+  <!-- JavaScript 核心逻辑 -->
+  <script>
+    // ==========================================
+    // 0. 全局状态与 Demo 模拟器
+    // ==========================================
+    const isDemoMode = new URLSearchParams(window.location.search).get('demo') === '1';
+    let currentStatus = null;
+    let currentTargets = [];
+    let currentHistory = [];
+    let doughnutChart = null;
+    let historyChart = null;
+    let pendingDeleteId = null;
+    let failureCount = 0;
+
+    if (isDemoMode) {
+      document.getElementById('demoBadge').classList.remove('hidden');
+      document.getElementById('demoBadge').classList.add('inline-flex');
+    }
+
+    // Demo 模式模拟数据
+    const mockState = {
+      status: {
+        status: "running",
+        storage_mode: "discard",
+        max_rate_mbps: 100,
+        max_connections: 3,
+        active_connections: 2,
+        speed_mbps: 84.6,
+        speed_mb_per_sec: 10.57,
+        today_bytes: 45678901234, // ~45.68 GB
+        daily_limit_gb: 300,
+        schedule: { start_hour: 1, end_hour: 18 }
+      },
+      targets: [
+        {
+          id: 1,
+          name: "Ubuntu 24.04 Desktop ISO (清华源)",
+          url: "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/noble/ubuntu-24.04-desktop-amd64.iso",
+          weight: 20,
+          enabled: true,
+          health: "Healthy",
+          latency_ms: 18,
+          cooldown_remaining_seconds: 0,
+          today_bytes: 18500000000,
+          total_bytes: 142000000000,
+          speed_mbps: 42.8,
+          speed_mb_per_sec: 5.35,
+          error_msg: ""
+        },
+        {
+          id: 2,
+          name: "Debian 12 DVD ISO (阿里云)",
+          url: "https://mirrors.aliyun.com/debian-cd/current/amd64/iso-dvd/debian-12.7.0-amd64-DVD-1.iso",
+          weight: 15,
+          enabled: true,
+          health: "Healthy",
+          latency_ms: 24,
+          cooldown_remaining_seconds: 0,
+          today_bytes: 14200000000,
+          total_bytes: 98000000000,
+          speed_mbps: 31.4,
+          speed_mb_per_sec: 3.92,
+          error_msg: ""
+        },
+        {
+          id: 3,
+          name: "腾讯云软件源 OpenCloudOS 9",
+          url: "https://mirrors.tencent.com/opencloudos/9/isos/x86_64/OpenCloudOS-9.0-2305-x86_64-dvd.iso",
+          weight: 10,
+          enabled: true,
+          health: "RateLimited",
+          latency_ms: 115,
+          cooldown_remaining_seconds: 16500, // ~4h35m
+          today_bytes: 6500000000,
+          total_bytes: 35000000000,
+          speed_mbps: 0.0,
+          speed_mb_per_sec: 0.0,
+          error_msg: "429 Too Many Requests (触发自动冷却)"
+        },
+        {
+          id: 4,
+          name: "华为云 openEuler 24.03 ISO",
+          url: "https://repo.huaweicloud.com/openeuler/openEuler-24.03-LTS/ISO/x86_64/openEuler-24.03-LTS-x86_64-dvd.iso",
+          weight: 10,
+          enabled: true,
+          health: "Healthy",
+          latency_ms: 32,
+          cooldown_remaining_seconds: 0,
+          today_bytes: 5400000000,
+          total_bytes: 48000000000,
+          speed_mbps: 10.4,
+          speed_mb_per_sec: 1.30,
+          error_msg: ""
+        },
+        {
+          id: 5,
+          name: "Arch Linux ISO (中科大源)",
+          url: "https://mirrors.ustc.edu.cn/archlinux/iso/latest/archlinux-x86_64.iso",
+          weight: 5,
+          enabled: true,
+          health: "Dead",
+          latency_ms: 0,
+          cooldown_remaining_seconds: 0,
+          today_bytes: 1078901234,
+          total_bytes: 12000000000,
+          speed_mbps: 0.0,
+          speed_mb_per_sec: 0.0,
+          error_msg: "dial tcp: connection reset by peer"
+        },
+        {
+          id: 6,
+          name: "微信 Windows 客户端官方直链",
+          url: "https://dldir1.qq.com/weixin/Windows/WeChatSetup.exe",
+          weight: 5,
+          enabled: false,
+          health: "Healthy",
+          latency_ms: 15,
+          cooldown_remaining_seconds: 0,
+          today_bytes: 0,
+          total_bytes: 6000000000,
+          speed_mbps: 0.0,
+          speed_mb_per_sec: 0.0,
+          error_msg: ""
+        }
+      ],
+      history: generateMockHistory()
+    };
+
+    function generateMockHistory() {
+      const list = [];
+      const now = new Date();
+      for (let i = 23; i >= 0; i--) {
+        const d = new Date(now.getTime() - i * 3600 * 1000);
+        d.setMinutes(0, 0, 0);
+        // 生成波动流量，白天大晚上小
+        const hour = d.getHours();
+        let baseGb = (hour >= 1 && hour <= 18) ? (1.5 + Math.random() * 2.8) : 0.1;
+        list.push({
+          hour: d.toISOString(),
+          bytes: Math.floor(baseGb * 1e9)
+        });
+      }
+      return list;
+    }
+
+    // ==========================================
+    // 1. 网络请求统一封装 (自动适配 Demo 模式)
+    // ==========================================
+    async function apiRequest(endpoint, options = {}) {
+      if (isDemoMode) {
+        return mockApiHandler(endpoint, options);
+      }
+
+      try {
+        const res = await fetch(endpoint, {
+          headers: { 'Content-Type': 'application/json' },
+          ...options
+        });
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.error || `HTTP ${res.status}`);
+        }
+        setOnline(true);
+        return await res.json();
+      } catch (err) {
+        setOnline(false);
+        throw err;
+      }
+    }
+
+    // 离线指示与横幅切换
+    function setOnline(online) {
+      const banner = document.getElementById('offlineBanner');
+      const dot = document.getElementById('onlineDot');
+      const text = document.getElementById('onlineText');
+
+      if (online) {
+        failureCount = 0;
+        banner.classList.add('hidden');
+        dot.className = "w-2.5 h-2.5 rounded-full bg-emerald-500 ring-4 ring-emerald-500/20";
+        text.textContent = "服务在线";
+      } else {
+        failureCount++;
+        if (failureCount >= 2) {
+          banner.classList.remove('hidden');
+        }
+        dot.className = "w-2.5 h-2.5 rounded-full bg-red-500 ring-4 ring-red-500/20";
+        text.textContent = "服务离线";
+      }
+    }
+
+    // Demo 模式请求拦截处理器
+    async function mockApiHandler(endpoint, options) {
+      await new Promise(r => setTimeout(r, 80)); // 仿真延迟
+      const method = (options.method || 'GET').toUpperCase();
+      const body = options.body ? JSON.parse(options.body) : {};
+
+      // 1. GET /api/status
+      if (endpoint === '/api/status' && method === 'GET') {
+        if (mockState.status.status === 'running') {
+          // 随机浮动速率与累计字节
+          const delta = (Math.random() - 0.48) * 4;
+          let s = Math.max(10, Math.min(mockState.status.max_rate_mbps || 100, mockState.status.speed_mbps + delta));
+          mockState.status.speed_mbps = parseFloat(s.toFixed(1));
+          mockState.status.speed_mb_per_sec = parseFloat((s / 8).toFixed(2));
+          const addBytes = Math.floor(mockState.status.speed_mb_per_sec * 1024 * 1024 * 2);
+          mockState.status.today_bytes += addBytes;
+        }
+        return JSON.parse(JSON.stringify(mockState.status));
+      }
+
+      // 2. GET /api/targets
+      if (endpoint === '/api/targets' && method === 'GET') {
+        return { targets: JSON.parse(JSON.stringify(mockState.targets)) };
+      }
+
+      // 3. POST /api/targets
+      if (endpoint === '/api/targets' && method === 'POST') {
+        const newId = (mockState.targets.length ? Math.max(...mockState.targets.map(t => t.id)) : 0) + 1;
+        const newTarget = {
+          id: newId,
+          name: body.name,
+          url: body.url,
+          weight: body.weight || 10,
+          enabled: body.enabled !== false,
+          health: "Unknown",
+          latency_ms: 0,
+          cooldown_remaining_seconds: 0,
+          today_bytes: 0,
+          total_bytes: 0,
+          speed_mbps: 0.0,
+          speed_mb_per_sec: 0.0,
+          error_msg: ""
+        };
+        mockState.targets.push(newTarget);
+        return { ok: true, id: newId };
+      }
+
+      // 4. PUT /api/targets/{id}
+      if (endpoint.startsWith('/api/targets/') && method === 'PUT') {
+        const id = parseInt(endpoint.split('/')[3], 10);
+        const t = mockState.targets.find(x => x.id === id);
+        if (t) {
+          if (body.name !== undefined) t.name = body.name;
+          if (body.url !== undefined) t.url = body.url;
+          if (body.weight !== undefined) t.weight = body.weight;
+          if (body.enabled !== undefined) t.enabled = body.enabled;
+        }
+        return { ok: true };
+      }
+
+      // 5. DELETE /api/targets/{id}
+      if (endpoint.startsWith('/api/targets/') && method === 'DELETE') {
+        const id = parseInt(endpoint.split('/')[3], 10);
+        mockState.targets = mockState.targets.filter(x => x.id !== id);
+        return { ok: true };
+      }
+
+      // 6. POST /api/targets/check
+      if (endpoint === '/api/targets/check' && method === 'POST') {
+        // 模拟探活
+        mockState.targets.forEach(t => {
+          if (t.health !== 'Dead') {
+            t.health = 'Healthy';
+            t.latency_ms = Math.floor(10 + Math.random() * 40);
+            t.cooldown_remaining_seconds = 0;
+            t.error_msg = "";
+          }
+        });
+        return { ok: true };
+      }
+
+      // 7. GET /api/history
+      if (endpoint === '/api/history' && method === 'GET') {
+        return { history: JSON.parse(JSON.stringify(mockState.history)) };
+      }
+
+      // 8. POST /api/control
+      if (endpoint === '/api/control' && method === 'POST') {
+        if (body.action === 'pause') {
+          mockState.status.status = 'paused';
+          mockState.status.speed_mbps = 0;
+          mockState.status.speed_mb_per_sec = 0;
+          mockState.status.active_connections = 0;
+        } else if (body.action === 'resume') {
+          mockState.status.status = 'running';
+          mockState.status.speed_mbps = 75.2;
+          mockState.status.speed_mb_per_sec = 9.4;
+          mockState.status.active_connections = 2;
+        } else if (body.action === 'update') {
+          if (body.max_rate_mbps !== undefined) mockState.status.max_rate_mbps = body.max_rate_mbps;
+          if (body.max_connections !== undefined) mockState.status.max_connections = body.max_connections;
+          if (body.daily_limit_gb !== undefined) mockState.status.daily_limit_gb = body.daily_limit_gb;
+          if (body.storage_mode !== undefined) mockState.status.storage_mode = body.storage_mode;
+        }
+        return { ok: true };
+      }
+
+      return { ok: true };
+    }
+
+    // ==========================================
+    // 2. 格式化工具函数
+    // ==========================================
+    // 1 GB = 1e9 bytes (按照契约决策 D3)
+    function formatBytes(bytes) {
+      if (bytes === 0 || !bytes) return '0 B';
+      const k = 1000;
+      const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return (bytes / Math.pow(k, i)).toFixed(i >= 3 ? 2 : 1) + ' ' + sizes[i];
+    }
+
+    function formatCooldown(seconds) {
+      if (!seconds || seconds <= 0) return '';
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = seconds % 60;
+      if (h > 0) return `冷却 ${h}h${m}m`;
+      if (m > 0) return `冷却 ${m}m`;
+      return `冷却 ${s}s`;
+    }
+
+    function formatHourLabel(isoString) {
+      try {
+        const d = new Date(isoString);
+        return `${String(d.getHours()).padStart(2, '0')}:00`;
+      } catch (e) {
+        return isoString;
+      }
+    }
+
+    function showToast(message, type = 'info') {
+      const container = document.getElementById('toastContainer');
+      const toast = document.createElement('div');
+      const colors = {
+        success: 'bg-emerald-600 text-white',
+        error: 'bg-red-600 text-white',
+        info: 'bg-slate-800 text-white dark:bg-slate-100 dark:text-slate-900'
+      };
+      toast.className = `${colors[type] || colors.info} px-4 py-2.5 rounded-xl shadow-lg text-xs font-medium flex items-center gap-2 transform transition-all duration-300 opacity-0 translate-y-2 pointer-events-auto`;
+      toast.textContent = message;
+      container.appendChild(toast);
+
+      requestAnimationFrame(() => {
+        toast.classList.remove('opacity-0', 'translate-y-2');
+      });
+
+      setTimeout(() => {
+        toast.classList.add('opacity-0', 'translate-y-2');
+        setTimeout(() => toast.remove(), 300);
+      }, 3000);
+    }
+
+    // ==========================================
+    // 3. 视图渲染与状态更新
+    // ==========================================
+    function updateStatusView(st) {
+      currentStatus = st;
+
+      // 1. 全局速率
+      document.getElementById('globalSpeedMbps').textContent = (st.speed_mbps !== undefined) ? st.speed_mbps.toFixed(1) : '0.0';
+      document.getElementById('globalSpeedMBps').textContent = (st.speed_mb_per_sec !== undefined) ? st.speed_mb_per_sec.toFixed(2) : '0.00';
+
+      // 2. 引擎状态徽标
+      const badge = document.getElementById('engineStatusBadge');
+      const badgeText = document.getElementById('engineStatusText');
+      const toggleBtn = document.getElementById('toggleEngineBtn');
+      const toggleLabel = document.getElementById('toggleEngineLabel');
+
+      const statusConfigs = {
+        running: { text: "运行中", color: "bg-emerald-50 dark:bg-emerald-950/50 text-emerald-600 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800", dot: "bg-emerald-500 animate-pulse" },
+        paused: { text: "已暂停", color: "bg-amber-50 dark:bg-amber-950/50 text-amber-600 dark:text-amber-400 border-amber-200 dark:border-amber-800", dot: "bg-amber-500" },
+        sleeping_schedule: { text: "时段休眠", color: "bg-blue-50 dark:bg-blue-950/50 text-blue-600 dark:text-blue-400 border-blue-200 dark:border-blue-800", dot: "bg-blue-500" },
+        quota_reached: { text: "达到配额", color: "bg-purple-50 dark:bg-purple-950/50 text-purple-600 dark:text-purple-400 border-purple-200 dark:border-purple-800", dot: "bg-purple-500" }
+      };
+
+      const cfg = statusConfigs[st.status] || { text: st.status, color: "bg-slate-100 text-slate-600 border-slate-300", dot: "bg-slate-400" };
+      badge.className = `flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border ${cfg.color}`;
+      badge.innerHTML = `<span class="w-2 h-2 rounded-full ${cfg.dot}"></span><span>${cfg.text}</span>`;
+
+      // 暂停/恢复按钮
+      if (st.status === 'paused') {
+        toggleBtn.className = "inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg shadow-sm transition-all text-white bg-emerald-600 hover:bg-emerald-700 active:scale-95";
+        toggleLabel.textContent = "恢复运行";
+      } else {
+        toggleBtn.className = "inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg shadow-sm transition-all text-white bg-amber-500 hover:bg-amber-600 active:scale-95";
+        toggleLabel.textContent = "暂停引擎";
+      }
+
+      // 3. 连接数
+      document.getElementById('activeConnCount').textContent = st.active_connections ?? 0;
+      document.getElementById('maxConnDisplay').textContent = st.max_connections ?? 2;
+
+      // 4. 今日流量与每日上限
+      const todayGb = (st.today_bytes / 1e9);
+      document.getElementById('todayTrafficGB').textContent = todayGb.toFixed(2);
+      document.getElementById('todayTrafficExact').textContent = formatBytes(st.today_bytes);
+
+      const limitGb = st.daily_limit_gb || 0;
+      const limitText = limitGb > 0 ? `${limitGb} GB` : '无限制';
+      document.getElementById('dailyLimitText').textContent = limitText;
+
+      let pct = 0;
+      if (limitGb > 0) {
+        pct = Math.min(100, Math.max(0, (todayGb / limitGb) * 100));
+        document.getElementById('quotaPercentText').textContent = `${pct.toFixed(1)}%`;
+        document.getElementById('quotaProgressBar').style.width = `${pct}%`;
+        if (pct >= 100) {
+          document.getElementById('quotaProgressBar').className = "bg-red-500 h-2 rounded-full progress-bar-transition";
+        } else if (pct >= 85) {
+          document.getElementById('quotaProgressBar').className = "bg-amber-500 h-2 rounded-full progress-bar-transition";
+        } else {
+          document.getElementById('quotaProgressBar').className = "bg-indigo-600 dark:bg-indigo-500 h-2 rounded-full progress-bar-transition";
+        }
+      } else {
+        document.getElementById('quotaPercentText').textContent = '未设限';
+        document.getElementById('quotaProgressBar').style.width = '100%';
+        document.getElementById('quotaProgressBar').className = "bg-slate-300 dark:bg-slate-600 h-2 rounded-full progress-bar-transition";
+      }
+
+      // 5. 限速输入框、最大连接、存储模式与活跃时段（避免打扰用户当前聚焦输入）
+      const rateInput = document.getElementById('maxRateInput');
+      if (document.activeElement !== rateInput) {
+        rateInput.value = st.max_rate_mbps;
+      }
+      document.getElementById('maxConnInput').value = st.max_connections;
+
+      const storageSelect = document.getElementById('storageModeSelect');
+      if (document.activeElement !== storageSelect) {
+        storageSelect.value = st.storage_mode;
+      }
+
+      if (st.schedule) {
+        const schStr = `${String(st.schedule.start_hour).padStart(2, '0')}:00 ~ ${String(st.schedule.end_hour).padStart(2, '0')}:00`;
+        document.getElementById('headerScheduleText').textContent = schStr;
+        document.getElementById('cardScheduleSpan').textContent = schStr;
+      }
+    }
+
+    function updateTargetsView(targets) {
+      currentTargets = targets;
+      document.getElementById('targetCountBadge').textContent = targets.length;
+      const tbody = document.getElementById('targetsTableBody');
+
+      if (!targets || targets.length === 0) {
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="8" class="text-center py-8 text-slate-400 dark:text-slate-500">
+              暂未添加任何下载目标节点，请点击上方“添加 URL”按钮新增直链。
+            </td>
+          </tr>
+        `;
+        updateDoughnutChart();
+        return;
+      }
+
+      tbody.innerHTML = targets.map(t => {
+        // 健康状态与指示灯
+        let healthBadge = '';
+        if (t.health === 'Healthy') {
+          healthBadge = `
+            <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-emerald-50 dark:bg-emerald-950/40 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800">
+              <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+              正常 ${t.latency_ms > 0 ? t.latency_ms + 'ms' : ''}
+            </span>`;
+        } else if (t.health === 'RateLimited') {
+          const cdText = formatCooldown(t.cooldown_remaining_seconds);
+          healthBadge = `
+            <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-amber-50 dark:bg-amber-950/40 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-800" title="${t.error_msg || ''}">
+              <span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>
+              限流 ${cdText ? '(' + cdText + ')' : ''}
+            </span>`;
+        } else if (t.health === 'Dead') {
+          healthBadge = `
+            <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-red-50 dark:bg-red-950/40 text-red-600 dark:text-red-400 border border-red-200 dark:border-red-800" title="${t.error_msg || ''}">
+              <span class="w-1.5 h-1.5 rounded-full bg-red-500"></span>
+              失效
+            </span>`;
+        } else {
+          healthBadge = `
+            <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400 border border-slate-200 dark:border-slate-600">
+              <span class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>
+              未知
+            </span>`;
+        }
+
+        // 错误提示图标
+        const errorIcon = t.error_msg ? `
+          <span class="text-amber-500 cursor-help" title="${escapeHtml(t.error_msg)}">
+            <svg class="w-3.5 h-3.5 inline" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+            </svg>
+          </span>
+        ` : '';
+
+        return `
+          <tr class="hover:bg-slate-50/80 dark:hover:bg-slate-700/30 transition-colors">
+            <!-- 名称与 URL -->
+            <td class="py-3 px-4 max-w-[280px]">
+              <div class="font-semibold text-slate-900 dark:text-slate-100 truncate" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</div>
+              <div class="text-[11px] text-slate-400 dark:text-slate-500 font-mono truncate" title="${escapeHtml(t.url)}">
+                <a href="${escapeHtml(t.url)}" target="_blank" rel="noopener noreferrer" class="hover:underline hover:text-indigo-500">${escapeHtml(t.url)}</a>
+              </div>
+            </td>
+
+            <!-- 状态 / 延迟 -->
+            <td class="py-3 px-3 whitespace-nowrap">
+              <div class="flex items-center gap-1">
+                ${healthBadge}
+                ${errorIcon}
+              </div>
+            </td>
+
+            <!-- 实时速度 -->
+            <td class="py-3 px-3 text-right font-mono whitespace-nowrap">
+              <div class="font-bold text-slate-800 dark:text-slate-200">${(t.speed_mbps || 0).toFixed(1)} <span class="text-[10px] text-slate-400 font-normal">Mbps</span></div>
+              <div class="text-[10px] text-slate-400">${(t.speed_mb_per_sec || 0).toFixed(2)} MB/s</div>
+            </td>
+
+            <!-- 今日流量 -->
+            <td class="py-3 px-3 text-right font-mono text-slate-700 dark:text-slate-300 whitespace-nowrap">
+              ${formatBytes(t.today_bytes)}
+            </td>
+
+            <!-- 累计流量 -->
+            <td class="py-3 px-3 text-right font-mono text-slate-700 dark:text-slate-300 whitespace-nowrap">
+              ${formatBytes(t.total_bytes)}
+            </td>
+
+            <!-- 权重 -->
+            <td class="py-3 px-3 text-center font-mono">
+              <span class="px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-700/60 text-slate-600 dark:text-slate-300 font-bold">${t.weight}</span>
+            </td>
+
+            <!-- 启用开关 -->
+            <td class="py-3 px-3 text-center whitespace-nowrap">
+              <button onclick="toggleTargetEnabled(${t.id}, ${!t.enabled})" class="relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${t.enabled ? 'bg-indigo-600' : 'bg-slate-200 dark:bg-slate-700'}">
+                <span class="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${t.enabled ? 'translate-x-4' : 'translate-x-0'}"></span>
+              </button>
+            </td>
+
+            <!-- 操作 -->
+            <td class="py-3 px-4 text-right whitespace-nowrap">
+              <div class="inline-flex items-center gap-1">
+                <!-- 编辑 -->
+                <button onclick="openEditTargetModal(${t.id})" class="p-1.5 rounded-lg text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 dark:hover:bg-slate-700 transition" title="编辑节点">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/>
+                  </svg>
+                </button>
+                <!-- 删除 -->
+                <button onclick="openDeleteModal(${t.id}, '${escapeHtml(t.name)}')" class="p-1.5 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-slate-700 transition" title="删除节点">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                  </svg>
+                </button>
+              </div>
+            </td>
+          </tr>
+        `;
+      }).join('');
+
+      updateDoughnutChart();
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    // ==========================================
+    // 4. Chart.js 渲染与主题自适应
+    // ==========================================
+    function getChartTheme() {
+      const isDark = document.documentElement.classList.contains('dark');
+      return {
+        textColor: isDark ? '#94a3b8' : '#64748b',
+        gridColor: isDark ? 'rgba(51, 65, 85, 0.4)' : 'rgba(226, 232, 240, 0.8)',
+        tooltipBg: isDark ? '#1e293b' : '#ffffff',
+        tooltipText: isDark ? '#f8fafc' : '#0f172a'
+      };
+    }
+
+    function updateDoughnutChart() {
+      const ctx = document.getElementById('doughnutChart');
+      const emptyState = document.getElementById('doughnutEmptyState');
+      if (!ctx) return;
+
+      const validTargets = currentTargets.filter(t => t.total_bytes > 0);
+      const totalSum = validTargets.reduce((acc, cur) => acc + cur.total_bytes, 0);
+
+      if (validTargets.length === 0 || totalSum === 0) {
+        if (doughnutChart) {
+          doughnutChart.destroy();
+          doughnutChart = null;
+        }
+        ctx.classList.add('hidden');
+        emptyState.classList.remove('hidden');
+        return;
+      }
+
+      ctx.classList.remove('hidden');
+      emptyState.classList.add('hidden');
+
+      const labels = validTargets.map(t => t.name);
+      const data = validTargets.map(t => t.total_bytes);
+
+      const colorPalette = [
+        '#6366f1', '#3b82f6', '#10b981', '#f59e0b',
+        '#ec4899', '#8b5cf6', '#14b8a6', '#f97316'
+      ];
+
+      const theme = getChartTheme();
+
+      if (doughnutChart) {
+        doughnutChart.data.labels = labels;
+        doughnutChart.data.datasets[0].data = data;
+        doughnutChart.update();
+      } else {
+        doughnutChart = new Chart(ctx, {
+          type: 'doughnut',
+          data: {
+            labels: labels,
+            datasets: [{
+              data: data,
+              backgroundColor: colorPalette,
+              borderWidth: 2,
+              borderColor: document.documentElement.classList.contains('dark') ? '#1e293b' : '#ffffff'
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+              legend: {
+                position: 'bottom',
+                labels: {
+                  boxWidth: 10,
+                  font: { size: 10 },
+                  color: theme.textColor
+                }
+              },
+              tooltip: {
+                callbacks: {
+                  label: function(context) {
+                    const val = context.parsed;
+                    const pct = ((val / totalSum) * 100).toFixed(1);
+                    return ` ${context.label}: ${formatBytes(val)} (${pct}%)`;
+                  }
+                }
+              }
+            },
+            cutout: '65%'
+          }
+        });
+      }
+    }
+
+    function updateHistoryChart(historyList) {
+      currentHistory = historyList;
+      const ctx = document.getElementById('historyChart');
+      if (!ctx || !historyList) return;
+
+      const labels = historyList.map(h => formatHourLabel(h.hour));
+      // 1 GB = 1e9 字节
+      const dataGb = historyList.map(h => parseFloat((h.bytes / 1e9).toFixed(3)));
+
+      const theme = getChartTheme();
+
+      if (historyChart) {
+        historyChart.data.labels = labels;
+        historyChart.data.datasets[0].data = dataGb;
+        historyChart.options.scales.x.ticks.color = theme.textColor;
+        historyChart.options.scales.x.grid.color = theme.gridColor;
+        historyChart.options.scales.y.ticks.color = theme.textColor;
+        historyChart.options.scales.y.grid.color = theme.gridColor;
+        historyChart.update();
+      } else {
+        const gradient = ctx.getContext('2d').createLinearGradient(0, 0, 0, 200);
+        gradient.addColorStop(0, 'rgba(99, 102, 241, 0.35)');
+        gradient.addColorStop(1, 'rgba(99, 102, 241, 0.0)');
+
+        historyChart = new Chart(ctx, {
+          type: 'line',
+          data: {
+            labels: labels,
+            datasets: [{
+              label: '每小时下行流量 (GB)',
+              data: dataGb,
+              borderColor: '#6366f1',
+              borderWidth: 2,
+              backgroundColor: gradient,
+              fill: true,
+              tension: 0.35,
+              pointRadius: 2,
+              pointHoverRadius: 5,
+              pointBackgroundColor: '#6366f1'
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+              x: {
+                grid: { color: theme.gridColor, drawBorder: false },
+                ticks: { color: theme.textColor, font: { size: 10 }, maxRotation: 0 }
+              },
+              y: {
+                beginAtZero: true,
+                grid: { color: theme.gridColor, drawBorder: false },
+                ticks: {
+                  color: theme.textColor,
+                  font: { size: 10 },
+                  callback: function(value) { return value + ' GB'; }
+                }
+              }
+            },
+            plugins: {
+              legend: { display: false },
+              tooltip: {
+                callbacks: {
+                  label: function(context) {
+                    return ` 下行流量: ${context.parsed.y} GB`;
+                  }
+                }
+              }
+            }
+          }
+        });
+      }
+    }
+
+    // 主题切换时重新刷新 Chart 样式
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+      const theme = getChartTheme();
+      if (doughnutChart) {
+        doughnutChart.options.plugins.legend.labels.color = theme.textColor;
+        doughnutChart.data.datasets[0].borderColor = document.documentElement.classList.contains('dark') ? '#1e293b' : '#ffffff';
+        doughnutChart.update();
+      }
+      if (historyChart) {
+        historyChart.options.scales.x.ticks.color = theme.textColor;
+        historyChart.options.scales.x.grid.color = theme.gridColor;
+        historyChart.options.scales.y.ticks.color = theme.textColor;
+        historyChart.options.scales.y.grid.color = theme.gridColor;
+        historyChart.update();
+      }
+    });
+
+    // ==========================================
+    // 5. 交互操作与 API 调用
+    // ==========================================
+
+    // 一键暂停 / 恢复
+    async function handleToggleEngine() {
+      if (!currentStatus) return;
+      const action = currentStatus.status === 'paused' ? 'resume' : 'pause';
+      try {
+        await apiRequest('/api/control', {
+          method: 'POST',
+          body: JSON.stringify({ action: action })
+        });
+        showToast(action === 'resume' ? '已恢复下载引擎' : '已暂停下载引擎', 'success');
+        await fetchStatus();
+      } catch (err) {
+        showToast(`操作失败: ${err.message}`, 'error');
+      }
+    }
+
+    // 修改全局限速
+    async function saveMaxRate() {
+      const val = parseInt(document.getElementById('maxRateInput').value, 10);
+      if (isNaN(val) || val < 0) {
+        showToast('请输入有效的限速值（0 为不限速）', 'error');
+        return;
+      }
+      try {
+        await apiRequest('/api/control', {
+          method: 'POST',
+          body: JSON.stringify({ action: 'update', max_rate_mbps: val })
+        });
+        showToast(`全局限速已更新为 ${val === 0 ? '不限速' : val + ' Mbps'}`, 'success');
+        await fetchStatus();
+      } catch (err) {
+        showToast(`更新限速失败: ${err.message}`, 'error');
+      }
+    }
+
+    // 步进修改并发连接数 (1-10)
+    async function stepConnections(delta) {
+      if (!currentStatus) return;
+      const cur = currentStatus.max_connections || 2;
+      const next = Math.max(1, Math.min(10, cur + delta));
+      if (next === cur) return;
+
+      try {
+        await apiRequest('/api/control', {
+          method: 'POST',
+          body: JSON.stringify({ action: 'update', max_connections: next })
+        });
+        showToast(`最大并发已更新为 ${next}`, 'success');
+        await fetchStatus();
+      } catch (err) {
+        showToast(`更新并发数失败: ${err.message}`, 'error');
+      }
+    }
+
+    // 修改存储模式
+    async function changeStorageMode(mode) {
+      try {
+        await apiRequest('/api/control', {
+          method: 'POST',
+          body: JSON.stringify({ action: 'update', storage_mode: mode })
+        });
+        showToast(`存储模式已切换为 ${mode}`, 'success');
+        await fetchStatus();
+      } catch (err) {
+        showToast(`切换存储模式失败: ${err.message}`, 'error');
+      }
+    }
+
+    // 快捷修改每日配额弹窗
+    function openQuotaModal() {
+      const cur = currentStatus ? (currentStatus.daily_limit_gb || 0) : 300;
+      document.getElementById('quotaInput').value = cur;
+      document.getElementById('quotaModal').classList.remove('hidden');
+    }
+
+    function closeQuotaModal() {
+      document.getElementById('quotaModal').classList.add('hidden');
+    }
+
+    async function handleQuotaSubmit(e) {
+      e.preventDefault();
+      const val = parseFloat(document.getElementById('quotaInput').value);
+      if (isNaN(val) || val < 0) {
+        showToast('请输入有效的配额数字（0 为不限额）', 'error');
+        return;
+      }
+
+      try {
+        await apiRequest('/api/control', {
+          method: 'POST',
+          body: JSON.stringify({ action: 'update', daily_limit_gb: val })
+        });
+        closeQuotaModal();
+        showToast(`每日配额已修改为 ${val === 0 ? '无限制' : val + ' GB'}`, 'success');
+        await fetchStatus();
+      } catch (err) {
+        showToast(`修改配额失败: ${err.message}`, 'error');
+      }
+    }
+
+    // 添加 URL 模态窗
+    function openAddTargetModal() {
+      document.getElementById('addName').value = '';
+      document.getElementById('addUrl').value = '';
+      document.getElementById('addWeight').value = '10';
+      document.getElementById('addEnabled').checked = true;
+      document.getElementById('addTargetModal').classList.remove('hidden');
+    }
+
+    function closeAddTargetModal() {
+      document.getElementById('addTargetModal').classList.add('hidden');
+    }
+
+    async function handleAddTargetSubmit(e) {
+      e.preventDefault();
+      const name = document.getElementById('addName').value.trim();
+      const url = document.getElementById('addUrl').value.trim();
+      const weight = parseInt(document.getElementById('addWeight').value, 10);
+      const enabled = document.getElementById('addEnabled').checked;
+
+      if (!name || !url) {
+        showToast('名称和 URL 为必填项', 'error');
+        return;
+      }
+      if (!/^https?:\/\//i.test(url)) {
+        showToast('URL 必须以 http:// 或 https:// 开头', 'error');
+        return;
+      }
+      if (isNaN(weight) || weight < 1) {
+        showToast('权重必须是 >= 1 的正整数', 'error');
+        return;
+      }
+
+      try {
+        await apiRequest('/api/targets', {
+          method: 'POST',
+          body: JSON.stringify({ name, url, weight, enabled })
+        });
+        closeAddTargetModal();
+        showToast(`成功添加节点: ${name}`, 'success');
+        await fetchTargets();
+        await fetchHistory();
+      } catch (err) {
+        showToast(`添加节点失败: ${err.message}`, 'error');
+      }
+    }
+
+    // 编辑 URL 模态窗
+    function openEditTargetModal(id) {
+      const t = currentTargets.find(x => x.id === id);
+      if (!t) return;
+      document.getElementById('editId').value = t.id;
+      document.getElementById('editName').value = t.name;
+      document.getElementById('editUrl').value = t.url;
+      document.getElementById('editWeight').value = t.weight;
+      document.getElementById('editEnabled').checked = t.enabled;
+      document.getElementById('editTargetModal').classList.remove('hidden');
+    }
+
+    function closeEditTargetModal() {
+      document.getElementById('editTargetModal').classList.add('hidden');
+    }
+
+    async function handleEditTargetSubmit(e) {
+      e.preventDefault();
+      const id = parseInt(document.getElementById('editId').value, 10);
+      const name = document.getElementById('editName').value.trim();
+      const url = document.getElementById('editUrl').value.trim();
+      const weight = parseInt(document.getElementById('editWeight').value, 10);
+      const enabled = document.getElementById('editEnabled').checked;
+
+      if (!name || !url) {
+        showToast('名称和 URL 不能为空', 'error');
+        return;
+      }
+      if (!/^https?:\/\//i.test(url)) {
+        showToast('URL 必须以 http:// 或 https:// 开头', 'error');
+        return;
+      }
+
+      try {
+        await apiRequest(`/api/targets/${id}`, {
+          method: 'PUT',
+          body: JSON.stringify({ name, url, weight, enabled })
+        });
+        closeEditTargetModal();
+        showToast('节点信息已保存', 'success');
+        await fetchTargets();
+      } catch (err) {
+        showToast(`修改节点失败: ${err.message}`, 'error');
+      }
+    }
+
+    // 切换启用开关
+    async function toggleTargetEnabled(id, enabled) {
+      try {
+        await apiRequest(`/api/targets/${id}`, {
+          method: 'PUT',
+          body: JSON.stringify({ enabled: enabled })
+        });
+        showToast(enabled ? '节点已启用' : '节点已禁用', 'info');
+        await fetchTargets();
+      } catch (err) {
+        showToast(`更新状态失败: ${err.message}`, 'error');
+      }
+    }
+
+    // 删除目标节点
+    function openDeleteModal(id, name) {
+      pendingDeleteId = id;
+      document.getElementById('deleteTargetName').textContent = name;
+      document.getElementById('deleteModal').classList.remove('hidden');
+    }
+
+    function closeDeleteModal() {
+      pendingDeleteId = null;
+      document.getElementById('deleteModal').classList.add('hidden');
+    }
+
+    async function executeDeleteTarget() {
+      if (!pendingDeleteId) return;
+      try {
+        await apiRequest(`/api/targets/${pendingDeleteId}`, {
+          method: 'DELETE'
+        });
+        closeDeleteModal();
+        showToast('节点已成功删除', 'success');
+        await fetchTargets();
+        await fetchHistory();
+      } catch (err) {
+        showToast(`删除节点失败: ${err.message}`, 'error');
+      }
+    }
+
+    // 测试全部连通性
+    async function triggerCheckAll() {
+      const btn = document.getElementById('checkAllBtn');
+      const text = document.getElementById('checkAllText');
+      const icon = document.getElementById('checkAllIcon');
+
+      btn.disabled = true;
+      text.textContent = "检测中...";
+      icon.classList.add('animate-spin');
+
+      try {
+        await apiRequest('/api/targets/check', { method: 'POST' });
+        showToast('已下发全部连通性检测任务，请稍候...', 'info');
+        // 等待 1.5 秒后刷新列表获取探活结果
+        setTimeout(async () => {
+          await fetchTargets();
+          btn.disabled = false;
+          text.textContent = "测试全部连通性";
+          icon.classList.remove('animate-spin');
+        }, 1500);
+      } catch (err) {
+        showToast(`连通性测试下发失败: ${err.message}`, 'error');
+        btn.disabled = false;
+        text.textContent = "测试全部连通性";
+        icon.classList.remove('animate-spin');
+      }
+    }
+
+    // ==========================================
+    // 6. 轮询调度器 (Status: 2s, Targets: 2s, History: 60s)
+    // ==========================================
+    async function fetchStatus() {
+      try {
+        const data = await apiRequest('/api/status');
+        updateStatusView(data);
+      } catch (e) {
+        // 错误由 apiRequest 处理
+      }
+    }
+
+    async function fetchTargets() {
+      try {
+        const data = await apiRequest('/api/targets');
+        updateTargetsView(data.targets || []);
+      } catch (e) {
+        // 错误由 apiRequest 处理
+      }
+    }
+
+    async function fetchHistory() {
+      try {
+        const data = await apiRequest('/api/history');
+        updateHistoryChart(data.history || []);
+      } catch (e) {
+        // 错误由 apiRequest 处理
+      }
+    }
+
+    async function initApp() {
+      await Promise.allSettled([fetchStatus(), fetchTargets(), fetchHistory()]);
+
+      // 状态与目标列表每 2 秒轮询一次
+      setInterval(() => {
+        fetchStatus();
+        fetchTargets();
+      }, 2000);
+
+      // 历史流量趋势每 60 秒轮询一次
+      setInterval(() => {
+        fetchHistory();
+      }, 60000);
+    }
+
+    // 页面加载完成后启动
+    window.addEventListener('DOMContentLoaded', initApp);
+  </script>
+</body>
+</html>
