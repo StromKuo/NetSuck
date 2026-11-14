@@ -152,6 +152,10 @@ func (s *server) handlePostTargets(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errors.Is(err, ErrValidation) {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -247,7 +251,7 @@ func (s *server) handlePutTarget(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusConflict, err.Error())
 			return
 		}
-		if isValidationError(err) {
+		if errors.Is(err, ErrValidation) {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -357,95 +361,97 @@ func (s *server) handlePostControl(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 
 	case "update":
-		if len(raw) == 1 {
-			writeJSONError(w, http.StatusBadRequest, "no update fields provided")
-			return
-		}
-
-		s.cfgMu.Lock()
-		candidate := deepCopyConfig(s.currentCfg)
-		s.cfgMu.Unlock()
-
-		if v, ok := raw["max_rate_mbps"]; ok {
-			var val int
-			if err := json.Unmarshal(v, &val); err != nil {
-				writeJSONError(w, http.StatusBadRequest, "invalid max_rate_mbps")
-				return
-			}
-			if err := ValidateMaxRateMbps(val); err != nil {
-				writeJSONError(w, http.StatusBadRequest, err.Error())
-				return
-			}
-			candidate.MaxRateMbps = val
-		}
-
-		if v, ok := raw["max_connections"]; ok {
-			var val int
-			if err := json.Unmarshal(v, &val); err != nil {
-				writeJSONError(w, http.StatusBadRequest, "invalid max_connections")
-				return
-			}
-			if err := ValidateMaxConnections(val); err != nil {
-				writeJSONError(w, http.StatusBadRequest, err.Error())
-				return
-			}
-			candidate.MaxConnections = val
-		}
-
-		if v, ok := raw["daily_limit_gb"]; ok {
-			var val float64
-			if err := json.Unmarshal(v, &val); err != nil {
-				writeJSONError(w, http.StatusBadRequest, "invalid daily_limit_gb")
-				return
-			}
-			if err := ValidateDailyLimitGB(val); err != nil {
-				writeJSONError(w, http.StatusBadRequest, err.Error())
-				return
-			}
-			candidate.DailyLimitGB = val
-		}
-
-		if v, ok := raw["storage_mode"]; ok {
-			var val string
-			if err := json.Unmarshal(v, &val); err != nil {
-				writeJSONError(w, http.StatusBadRequest, "invalid storage_mode")
-				return
-			}
-			if err := ValidateStorageMode(val); err != nil {
-				writeJSONError(w, http.StatusBadRequest, err.Error())
-				return
-			}
-			candidate.StorageMode = val
-		}
-
-		if err := candidate.Validate(); err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-
-		var persistErr error
-		err := s.engine.ApplyConfigUpdate(candidate, func() error {
-			persistErr = candidate.Save(s.configPath)
-			return persistErr
-		})
-		if err != nil {
-			if persistErr != nil {
-				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("persist config failed: %v", persistErr))
-				return
-			}
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-
-		s.cfgMu.Lock()
-		s.currentCfg = candidate
-		s.cfgMu.Unlock()
-
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		s.handleControlUpdate(w, raw)
 
 	default:
 		writeJSONError(w, http.StatusBadRequest, "invalid action: "+action)
 	}
+}
+
+func (s *server) handleControlUpdate(w http.ResponseWriter, raw map[string]json.RawMessage) {
+	if len(raw) == 1 {
+		writeJSONError(w, http.StatusBadRequest, "no update fields provided")
+		return
+	}
+
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+
+	candidate := deepCopyConfig(s.currentCfg)
+
+	if v, ok := raw["max_rate_mbps"]; ok {
+		var val int
+		if err := json.Unmarshal(v, &val); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid max_rate_mbps")
+			return
+		}
+		if err := ValidateMaxRateMbps(val); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		candidate.MaxRateMbps = val
+	}
+
+	if v, ok := raw["max_connections"]; ok {
+		var val int
+		if err := json.Unmarshal(v, &val); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid max_connections")
+			return
+		}
+		if err := ValidateMaxConnections(val); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		candidate.MaxConnections = val
+	}
+
+	if v, ok := raw["daily_limit_gb"]; ok {
+		var val float64
+		if err := json.Unmarshal(v, &val); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid daily_limit_gb")
+			return
+		}
+		if err := ValidateDailyLimitGB(val); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		candidate.DailyLimitGB = val
+	}
+
+	if v, ok := raw["storage_mode"]; ok {
+		var val string
+		if err := json.Unmarshal(v, &val); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid storage_mode")
+			return
+		}
+		if err := ValidateStorageMode(val); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		candidate.StorageMode = val
+	}
+
+	if err := candidate.Validate(); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var persistErr error
+	err := s.engine.ApplyConfigUpdate(candidate, func() error {
+		persistErr = candidate.Save(s.configPath)
+		return persistErr
+	})
+	if err != nil {
+		if persistErr != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("persist config failed: %v", persistErr))
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	s.currentCfg = candidate
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 type captureWriter struct {
@@ -518,17 +524,7 @@ func writeJSONError(w http.ResponseWriter, code int, msg string) {
 }
 
 func isValidationError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "不能为空") ||
-		strings.Contains(msg, "必须使用 http/https") ||
-		strings.Contains(msg, "缺少主机名") ||
-		strings.Contains(msg, "不能包含用户名") ||
-		strings.Contains(msg, "必须 >= 1") ||
-		strings.Contains(msg, "解析失败") ||
-		strings.Contains(msg, "非法")
+	return errors.Is(err, ErrValidation)
 }
 
 func deepCopyConfig(src *Config) *Config {

@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -368,6 +370,64 @@ func TestControlEndpoints(t *testing.T) {
 	}
 }
 
+func TestControlConcurrentUpdates(t *testing.T) {
+	srv, configPath := setupTestServer(t)
+	handler := srv.routes()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	errCh := make(chan error, 2)
+
+	// Goroutine 1: update max_rate_mbps
+	go func() {
+		defer wg.Done()
+		req := httptest.NewRequest(http.MethodPost, "/api/control", bytes.NewReader([]byte(`{"action":"update","max_rate_mbps":250}`)))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			errCh <- fmt.Errorf("update rate failed: code %d, body %s", rec.Code, rec.Body.String())
+		}
+	}()
+
+	// Goroutine 2: update daily_limit_gb
+	go func() {
+		defer wg.Done()
+		req := httptest.NewRequest(http.MethodPost, "/api/control", bytes.NewReader([]byte(`{"action":"update","daily_limit_gb":75.0}`)))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			errCh <- fmt.Errorf("update quota failed: code %d, body %s", rec.Code, rec.Body.String())
+		}
+	}()
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	// 断言两者最终都保留
+	snap := srv.engine.Snapshot()
+	if snap.MaxRateMbps != 250 {
+		t.Errorf("expected MaxRateMbps=250, got %d", snap.MaxRateMbps)
+	}
+	if snap.DailyLimitGB != 75.0 {
+		t.Errorf("expected DailyLimitGB=75.0, got %f", snap.DailyLimitGB)
+	}
+
+	loaded, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if loaded.MaxRateMbps != 250 {
+		t.Errorf("persisted MaxRateMbps mismatch: want 250, got %d", loaded.MaxRateMbps)
+	}
+	if loaded.DailyLimitGB != 75.0 {
+		t.Errorf("persisted DailyLimitGB mismatch: want 75.0, got %f", loaded.DailyLimitGB)
+	}
+}
+
 func TestEnsureConfigFile(t *testing.T) {
 	tempDir := t.TempDir()
 	targetPath := filepath.Join(tempDir, "sub", "config.yaml")
@@ -393,5 +453,38 @@ func TestEnsureConfigFile(t *testing.T) {
 	after, err := os.ReadFile(targetPath)
 	if err != nil || !bytes.Equal(after, marker) {
 		t.Fatalf("ensureConfigFile should not overwrite existing file")
+	}
+}
+
+func TestValidationErrorClassification(t *testing.T) {
+	// 场景 1：包装错误（wrapped error）—— 使用 fmt.Errorf("%w: ...", ErrValidation) 包装的错误必须被识别为校验错误 (400)
+	wrappedErr := fmt.Errorf("target validation failed: %w", ErrValidation)
+	if !isValidationError(wrappedErr) {
+		t.Errorf("expected wrappedErr to be recognized as validation error")
+	}
+	if !errors.Is(wrappedErr, ErrValidation) {
+		t.Errorf("expected errors.Is(wrappedErr, ErrValidation) to be true")
+	}
+
+	// 场景 2：文案变更（message change）—— 不包含任何旧中文关键词的英文/自定义提示，但携带 ErrValidation 哨兵，必须被识别为校验错误 (400)
+	customMsgErr := fmt.Errorf("%w: invalid parameter format without legacy keywords", ErrValidation)
+	if !isValidationError(customMsgErr) {
+		t.Errorf("expected customMsgErr to be recognized as validation error")
+	}
+	if !errors.Is(customMsgErr, ErrValidation) {
+		t.Errorf("expected errors.Is(customMsgErr, ErrValidation) to be true")
+	}
+
+	// 场景 3：带敏感词的内部错误（internal error with keywords）—— 包含“非法”、“不能为空”、“解析失败”等敏感词但未包装 ErrValidation 的内部数据库或系统错误，绝对不能被判定为校验错误（防止 500 误报成 400）
+	internalErrWithKeywords := errors.New("database disk corruption: table targets 列名非法 且字段不能为空 解析失败")
+	if isValidationError(internalErrWithKeywords) {
+		t.Errorf("expected internal error with keywords to NOT be recognized as validation error")
+	}
+	if errors.Is(internalErrWithKeywords, ErrValidation) {
+		t.Errorf("expected errors.Is(internalErrWithKeywords, ErrValidation) to be false")
+	}
+
+	if isValidationError(nil) {
+		t.Errorf("nil error should not be recognized as validation error")
 	}
 }
