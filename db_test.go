@@ -1,11 +1,13 @@
 package main
 
 import (
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+	_ "modernc.org/sqlite"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -318,7 +320,7 @@ func TestPatchTargetAtomicResetsHealth(t *testing.T) {
 	// 写入非默认健康（RateLimited + 冷却 + 错误计数）。
 	err := store.PersistBatch(CounterBatch{
 		TargetHealth: map[int64]TargetHealthPersist{
-			created.ID: {Health: "RateLimited", CooldownUntilMS: 123456, LastStatusCode: 429, LatencyMS: 88, ErrorMsg: "limited", ConsecutiveErrors: 2},
+			created.ID: {Health: "RateLimited", CooldownUntilMS: 123456, LastStatusCode: 429, LatencyMS: 88, ErrorMsg: "limited", ConsecutiveErrors: 2, Generation: 1},
 		},
 		Seq: 1,
 	})
@@ -339,7 +341,7 @@ func TestPatchTargetAtomicResetsHealth(t *testing.T) {
 	// 未重置模式：仅改 URL/名称，保留现有健康（等价原 PatchTarget）。
 	err = store.PersistBatch(CounterBatch{
 		TargetHealth: map[int64]TargetHealthPersist{
-			created.ID: {Health: "Dead", CooldownUntilMS: 0, LastStatusCode: 404, LatencyMS: 5, ErrorMsg: "gone", ConsecutiveErrors: 0},
+			created.ID: {Health: "Dead", CooldownUntilMS: 0, LastStatusCode: 404, LatencyMS: 5, ErrorMsg: "gone", ConsecutiveErrors: 0, Generation: 2},
 		},
 		Seq: 2,
 	})
@@ -924,5 +926,84 @@ func TestA1GenerationBarrierPreservesState(t *testing.T) {
 	}
 	if after2.Health != "Healthy" {
 		t.Fatalf("正确代际应可写健康: %+v", after2)
+	}
+}
+
+// U2：generation 列旧库迁移——旧 schema（无 generation）建库+数据+冷却，升级后保留且 generation=1，幂等。
+func TestU2GenerationColumnMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", sqliteDSN(path))
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	// 旧版 schema（无 generation 列）。
+	oldSchema := []string{
+		`CREATE TABLE targets (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, url TEXT NOT NULL,
+			weight INTEGER NOT NULL DEFAULT 10, enabled INTEGER NOT NULL DEFAULT 1,
+			health TEXT NOT NULL DEFAULT 'Unknown', cooldown_until_ms INTEGER NOT NULL DEFAULT 0,
+			last_status_code INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0,
+			error_msg TEXT NOT NULL DEFAULT '', consecutive_errors INTEGER NOT NULL DEFAULT 0,
+			total_bytes INTEGER NOT NULL DEFAULT 0, deleted_at INTEGER)`,
+		`CREATE TABLE daily_stats (day TEXT NOT NULL, target_id INTEGER NOT NULL, bytes INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(day,target_id))`,
+		`CREATE TABLE history (hour_ts INTEGER PRIMARY KEY, bytes INTEGER NOT NULL DEFAULT 0)`,
+		`CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+	}
+	for _, stmt := range oldSchema {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("old schema %q: %v", stmt, err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO targets(name,url,weight,enabled,health,cooldown_until_ms,total_bytes)
+		VALUES('A','https://a.bin',10,1,'RateLimited',123456,5000)`); err != nil {
+		t.Fatalf("insert target: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO daily_stats(day,target_id,bytes) VALUES('2024-01-01',1,3000)`); err != nil {
+		t.Fatalf("insert daily: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO history(hour_ts,bytes) VALUES(1704067200,2000)`); err != nil {
+		t.Fatalf("insert history: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	// 升级：新 OpenStore + InitSchema（触发 ALTER ADD generation）。
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.InitSchema(); err != nil {
+		t.Fatalf("InitSchema(升级): %v", err)
+	}
+	state, err := store.LoadEngineState(time.Date(2024, 1, 1, 12, 0, 0, 0, time.Local))
+	if err != nil {
+		t.Fatalf("LoadEngineState: %v", err)
+	}
+	var rec TargetRecord
+	for _, r := range state.Targets {
+		if r.URL == "https://a.bin" {
+			rec = r
+		}
+	}
+	if rec.ID == 0 {
+		t.Fatalf("升级后目标缺失")
+	}
+	if rec.Generation != 1 {
+		t.Fatalf("generation=%d, want 1", rec.Generation)
+	}
+	if rec.Health != "RateLimited" || rec.CooldownUntilMS != 123456 || rec.TotalBytes != 5000 {
+		t.Fatalf("健康/冷却/流量未保留: %+v", rec)
+	}
+	if got := state.TargetDays["2024-01-01"][rec.ID]; got != 3000 {
+		t.Fatalf("今日流量未保留: %d", got)
+	}
+	if got := state.HourBuckets[1704067200]; got != 2000 {
+		t.Fatalf("历史桶未保留: %d", got)
+	}
+	// 幂等：再次 InitSchema 仍成功。
+	if err := store.InitSchema(); err != nil {
+		t.Fatalf("2nd InitSchema: %v", err)
 	}
 }

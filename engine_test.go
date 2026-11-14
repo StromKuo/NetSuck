@@ -1952,6 +1952,11 @@ func TestA3ProbeBodyDelayHealthy(t *testing.T) {
 	if bodyBytes.Load() == 0 {
 		t.Fatalf("body 未读取（网络窗口未覆盖 body）")
 	}
+	// small3：客户端实际接收字节断言（目标 TodayBytes=body 16 字节），非仅 server 写入计数。
+	snap := e.Snapshot()
+	if ts, ok := allTargets(snap)[rec.ID]; !ok || ts.TodayBytes != 16 {
+		t.Fatalf("客户端 TodayBytes=%d, want 16（body 字节未正确计入）", ts.TodayBytes)
+	}
 }
 
 // A3：真网络超时（服务端挂起不响应头）→ 探活置 Dead。
@@ -1976,4 +1981,109 @@ func TestA3ProbeNetworkTimeoutDead(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatalf("探活网络超时未置 Dead")
+}
+
+// U1：配额版本校验在 waitRate 后、Read 前 —— 生产 readLoop 路径：耗尽 burst 使 waitRate 阻塞，
+// 阻塞期间切限额 100 → 释放等待 → 重校验按新预算读取 ≤100。
+func TestU1QuotaRevalidateAfterWait(t *testing.T) {
+	e, _ := newTestEngine(t, nil, true)
+	tgt := &target{id: 110, total: new(atomic.Int64)}
+	e.stateMu.Lock()
+	e.targets[110] = tgt
+	e.stateMu.Unlock()
+	body := io.LimitReader(zeroReader{}, 1<<20) // 1MB
+
+	// 耗尽 limiter 的 64KB burst，使 readLoop 的 waitRate 阻塞（令牌不足需按速率补充）。
+	if err := e.SetMaxRate(1); err != nil { // 1 Mbps
+		t.Fatal(err)
+	}
+	if err := e.limiter.WaitN(context.Background(), 64*1024); err != nil {
+		t.Fatalf("耗尽 burst: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- e.readLoop(context.Background(), tgt, 1, body, io.Discard) }()
+	time.Sleep(20 * time.Millisecond) // 让 readLoop 进入 waitRate（令牌 0，阻塞）
+	// 等待期间切限额 100，然后释放等待（切不限速）→ readLoop 在 waitRate 后重校验按新预算读取。
+	if err := e.SetDailyLimit(0.0000001); err != nil { // 100 字节
+		t.Fatal(err)
+	}
+	if err := e.SetMaxRate(0); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("readLoop 未返回")
+	}
+	if got := tgt.total.Load(); got > 100 {
+		t.Fatalf("切限额后读取总量 %d 超过 100（U1 版本校验时点错误）", got)
+	}
+	if got := tgt.total.Load(); got == 0 {
+		t.Fatalf("应读取少量字节（0 表示被错误阻塞）")
+	}
+}
+
+// U1：跨午夜在读中（生产 readLoop）——旧日+新日 reader 合计不超新日预算。
+func TestU1QuotaCrossMidnightReadLoop(t *testing.T) {
+	clk := &fakeClock{now: time.Date(2024, 1, 1, 23, 55, 0, 0, time.Local)}
+	e, _ := newTestEngine(t, clk, true)
+	tgt := &target{id: 111, total: new(atomic.Int64)}
+	e.stateMu.Lock()
+	e.targets[111] = tgt
+	e.stateMu.Unlock()
+	e.SetDailyLimit(0.00001) // 10000
+
+	// reader A：读慢 body（每 10ms 发若干字节，总量 3000 后 EOF），跨午夜仍在读。
+	slow := io.LimitReader(&throttledReader{perRead: 64, interval: 10 * time.Millisecond}, 3000)
+	doneA := make(chan error, 1)
+	go func() { doneA <- e.readLoop(context.Background(), tgt, 1, slow, io.Discard) }()
+	time.Sleep(30 * time.Millisecond) // 让 A 进入 Read
+	clk.advance(15 * time.Minute)     // 跨午夜
+	e.recomputeGate()
+
+	// reader B：新日 readLoop。
+	doneB := make(chan error, 1)
+	go func() { doneB <- e.readLoop(context.Background(), tgt, 1, io.LimitReader(zeroReader{}, 1<<20), io.Discard) }()
+	// 让 B 读到配额触达。
+	select {
+	case <-doneB:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("reader B 未返回")
+	}
+	// 等 A 结束（读了 3000 或配额触达）。
+	select {
+	case <-doneA:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("reader A 未返回")
+	}
+	e.countMu.Lock()
+	total := int64(0)
+	if g := e.globalDays[e.currentDay]; g != nil {
+		total = g.Load()
+	}
+	e.countMu.Unlock()
+	if total > 10000 {
+		t.Fatalf("跨午夜合计 %d 超 10000（U1 在途预留未迁移扣减）", total)
+	}
+}
+
+// throttledReader 每 interval 返回 perRead 字节，模拟慢 body。
+type throttledReader struct {
+	perRead  int
+	interval time.Duration
+	sent     int64
+}
+
+func (r *throttledReader) Read(p []byte) (int, error) {
+	time.Sleep(r.interval)
+	n := r.perRead
+	if n > len(p) {
+		n = len(p)
+	}
+	for i := 0; i < n; i++ {
+		p[i] = 0
+	}
+	r.sent += int64(n)
+	return n, nil
 }

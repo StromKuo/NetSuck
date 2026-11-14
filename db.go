@@ -183,6 +183,49 @@ func (s *Store) InitSchema() error {
 			return fmt.Errorf("db: init schema: %w", err)
 		}
 	}
+	// U2：幂等迁移——旧库 targets 表缺 generation 列时 ALTER ADD（保留 URL/统计/冷却），重复执行无副作用。
+	if err := s.migrateTargetsGeneration(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// migrateTargetsGeneration 检测 targets 表是否缺 generation 列（旧 schema），缺失则 ALTER ADD。
+func (s *Store) migrateTargetsGeneration(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(targets)`)
+	if err != nil {
+		return fmt.Errorf("db: pragma table_info: %w", err)
+	}
+	has := false
+	var cols []string
+	for rows.Next() {
+		var cid, name, ctype, notnull, dflt, pk interface{}
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("db: pragma scan: %w", err)
+		}
+		if n, ok := name.(string); ok {
+			cols = append(cols, n)
+			if n == "generation" {
+				has = true
+			}
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("db: pragma rows: %w", err)
+	}
+	if has {
+		return nil // 已存在，幂等
+	}
+	if len(cols) == 0 {
+		// 表不存在（全新 DB，schemaStatements 已建含 generation），无迁移必要。
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`ALTER TABLE targets ADD COLUMN generation INTEGER NOT NULL DEFAULT 1`); err != nil {
+		return fmt.Errorf("db: migrate add generation: %w", err)
+	}
 	return nil
 }
 
@@ -502,13 +545,17 @@ func (s *Store) PersistBatch(b CounterBatch) error {
 	}
 
 	for targetID, h := range b.TargetHealth {
-		// A1：健康写回带 generation 屏障——仅当代际不大于快照 gen 才写回，旧健康批不得覆盖
-		// PatchTargetAtomic 已推进的新代际（如改 URL 后旧 403 冷却批）。
-		// h.Generation==0 表示批次未携带代际信息（直接构造/旧数据），不启用屏障，保持兼容。
+		// A1/small1：健康写回带精确 generation 屏障——仅当代际不大于快照 gen 才写回，旧/无版本健康批
+		// 不得覆盖 PatchTargetAtomic 已推进的新代际（如改 URL 后旧 403 冷却批）；h.Generation==0 视作
+		// 基线代际 1（明确兼容入口归一化），不使无版本批绕过新链接保护。
+		effGen := h.Generation
+		if effGen == 0 {
+			effGen = 1
+		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE targets SET health = ?, cooldown_until_ms = ?, last_status_code = ?,
-			 latency_ms = ?, error_msg = ?, consecutive_errors = ? WHERE id = ? AND (? <= 0 OR generation <= ?)`,
-			h.Health, h.CooldownUntilMS, h.LastStatusCode, h.LatencyMS, h.ErrorMsg, h.ConsecutiveErrors, targetID, h.Generation, h.Generation,
+			 latency_ms = ?, error_msg = ?, consecutive_errors = ? WHERE id = ? AND generation <= ?`,
+			h.Health, h.CooldownUntilMS, h.LastStatusCode, h.LatencyMS, h.ErrorMsg, h.ConsecutiveErrors, targetID, effGen,
 		); err != nil {
 			return fmt.Errorf("db: batch health %d: %w", targetID, err)
 		}

@@ -1287,11 +1287,6 @@ func (e *Engine) readLoop(ctx context.Context, t *target, gen uint64, body io.Re
 		}
 		// M1：Read 前按日预留 min(读长, 剩余额度)；amount==0=配额触达。
 		tok := e.quotaReserve(int64(len(buf)))
-		// A2：旧版本 token（限额/跨日切换后）在 Read 前失效重校验：释放旧预留并重按当前预算预约。
-		for tok.amount != 0 && tok.version != e.quotaVersion() {
-			e.releaseTokenBooking(tok)
-			tok = e.quotaReserve(int64(len(buf)))
-		}
 		if tok.amount == 0 {
 			return errQuotaReached
 		}
@@ -1299,6 +1294,15 @@ func (e *Engine) readLoop(ctx context.Context, t *target, gen uint64, body io.Re
 		if err := e.waitRate(ctx, int(tok.amount)); err != nil {
 			e.settleRead(tok, t, 0) // 取消路径：归还全部预留，无字节入桶
 			return err
+		}
+		// U1：版本校验/重预约移到 waitRate 结束后、紧邻实际 Read —— 限额/跨日在等待期间变化时，
+		// 释放旧预留并按当前预算重预约，再据新读长读取。
+		for tok.amount != 0 && tok.version != e.quotaVersion() {
+			e.releaseTokenBooking(tok)
+			tok = e.quotaReserve(int64(len(buf)))
+		}
+		if tok.amount == 0 {
+			return errQuotaReached
 		}
 		rn, rerr := body.Read(buf[:tok.amount])
 		// M1：结算=释放对应日未消费预留 + 把实际 rn 归入完成时刻所在日。
@@ -1424,14 +1428,14 @@ func (e *Engine) settleRead(tok quotaToken, t *target, rn int64) {
 	now := e.clock.Now().In(time.Local)
 	completionDay := dayKey(now)
 	e.ensureDay(completionDay, now)
-	// R3：仅真实预留（booked）释放对应预留日的 reserved；无限令牌不预留、也不得退他人预留。
+	// R3/U1：仅真实预留（booked）释放；预留已随跨日迁移到 currentDay 账本，故按 currentDay 释放。
 	if tok.booked {
-		cur := e.reserved[tok.day]
+		cur := e.reserved[e.currentDay]
 		rel := tok.amount
 		if rel > cur {
 			rel = cur
 		}
-		e.reserved[tok.day] = cur - rel
+		e.reserved[e.currentDay] = cur - rel
 	}
 	// 已读 rn 入 globalDays=实际消费（始终按完成日结算），未读部分随释放回到可用预算。
 	if rn > 0 {
@@ -1449,12 +1453,12 @@ func (e *Engine) releaseTokenBooking(tok quotaToken) {
 		return
 	}
 	e.countMu.Lock()
-	cur := e.reserved[tok.day]
+	cur := e.reserved[e.currentDay]
 	rel := tok.amount
 	if rel > cur {
 		rel = cur
 	}
-	e.reserved[tok.day] = cur - rel
+	e.reserved[e.currentDay] = cur - rel
 	e.countMu.Unlock()
 }
 
@@ -1492,7 +1496,13 @@ func (e *Engine) ensureDay(day string, now time.Time) {
 	if e.currentDay == day {
 		return
 	}
+	oldDay := e.currentDay
 	e.currentDay = day
+	// U1：跨日把在途预留迁移到新日账本，使"已进入 Read 的许可"计入新日预算（放行新预算前扣减旧在途）。
+	if old := e.reserved[oldDay]; old > 0 {
+		e.reserved[day] += old
+		e.reserved[oldDay] = 0
+	}
 	e.qVersion.Add(1) // 旧预留令牌版本失效
 	e.recomputeGateLockedQuota()
 }
@@ -2102,8 +2112,8 @@ func (e *Engine) probeOne(id int64) {
 		defer e.releaseHost(heldHost)
 	}
 	if err != nil {
-		// F9：先判引擎/CRUD 取消原因（含冷却准入拦截、host 忙等待取消），再分类远端故障。
-		if e.probeNotRemoteFault(err) {
+		// F9/U1-small2：先判本地原因（引擎/CRUD/轮次预算到期），再分类远端故障。
+		if e.probeNotRemoteFault(err, roundCtx) {
 			return
 		}
 		e.onProbeTransportError(t, gen, err, latency)
@@ -2120,7 +2130,7 @@ func (e *Engine) probeOne(id int64) {
 	// 探活字节计入统计与限速（规则 12）。A3：body 读取由 resp.Body 内携带的网络窗口（10s，随 Close 结束）
 	// 约束，与请求 ctx 同属一段网络期限；probeRead 的限速等待用总轮次预算 roundCtx。
 	if err := e.probeRead(roundCtx, t, resp.Body); err != nil {
-		if e.probeNotRemoteFault(err) {
+		if e.probeNotRemoteFault(err, roundCtx) {
 			return
 		}
 		e.onProbeTransportError(t, gen, err, latency)
@@ -2138,7 +2148,7 @@ func (e *Engine) probeOne(id int64) {
 // probeNotRemoteFault 判断探活错误是否因引擎关闭/CRUD 取消引起（非远端故障，规则 13/F9）。
 // 引擎/生命周期取消（lifeCtx）或 context.Canceled 不算远端故障；DeadlineExceeded（10s 自身超时）与
 // 传输 reset 等归类为远端故障 → Dead。
-func (e *Engine) probeNotRemoteFault(err error) bool {
+func (e *Engine) probeNotRemoteFault(err error, roundCtx context.Context) bool {
 	if e.lifeCtx.Err() != nil {
 		return true // 引擎关闭
 	}
@@ -2148,6 +2158,11 @@ func (e *Engine) probeNotRemoteFault(err error) bool {
 	if errors.Is(err, errProbeSkipped) {
 		return true // 本地 host 忙等待超时，不改健康（M4）
 	}
+	// U1-small2：总轮次预算（roundCtx）到期 → 本地原因（探活整体超预算），不改远端健康；
+	// 而单跳 10s 网络超时（netCtx 先于 roundCtx 到期）→ 远端 → Dead。
+	if roundCtx != nil && roundCtx.Err() == context.DeadlineExceeded {
+		return true
+	}
 	return false
 }
 
@@ -2156,17 +2171,20 @@ func (e *Engine) probeRead(ctx context.Context, t *target, body io.Reader) error
 	buf := make([]byte, probeRange)
 	// M1：探活同样按日预留-结算-退还。
 	tok := e.quotaReserve(int64(len(buf)))
-	// A2：旧版本 token 在 Read 前失效重校验。
-	for tok.amount != 0 && tok.version != e.quotaVersion() {
-		e.releaseTokenBooking(tok)
-		tok = e.quotaReserve(int64(len(buf)))
-	}
 	if tok.amount == 0 {
 		return nil // 配额触达，本次探活不读字节（不影响健康）
 	}
 	if err := e.waitRate(ctx, int(tok.amount)); err != nil {
 		e.settleRead(tok, t, 0)
 		return err
+	}
+	// U1：版本校验/重预约移到 waitRate 后、紧邻实际 Read。
+	for tok.amount != 0 && tok.version != e.quotaVersion() {
+		e.releaseTokenBooking(tok)
+		tok = e.quotaReserve(int64(len(buf)))
+	}
+	if tok.amount == 0 {
+		return nil // 配额触达，本次探活不读字节（不影响健康）
 	}
 	n, rerr := body.Read(buf[:tok.amount])
 	e.settleRead(tok, t, int64(n))
