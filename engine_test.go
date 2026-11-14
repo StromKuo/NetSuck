@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"golang.org/x/time/rate"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -2268,6 +2269,8 @@ func TestP1SetDailyLimitCancelsProbe(t *testing.T) {
 }
 
 // P2：重预约读长增大时补等速率令牌——低速下旧小配额→切无限，本次读取不超过速率预算。
+// E2：重预约读长增大时补等差额令牌（P2）——低速下小有限配额耗尽 burst 使首个预约等待，等待期间
+// 提高配额 → 首个迭代重预约读长增大，须补等差额令牌后才进入 Read（移除差额 waitRate 的实现必失败）。
 func TestP2ReReserveLargerReWaitsRate(t *testing.T) {
 	e, _ := newTestEngine(t, nil, true)
 	tgt := &target{id: 120, total: new(atomic.Int64)}
@@ -2276,26 +2279,101 @@ func TestP2ReReserveLargerReWaitsRate(t *testing.T) {
 	e.stateMu.Unlock()
 	body := io.LimitReader(zeroReader{}, 1<<20) // 1MB
 
-	// 低速（1Mbps）并耗尽 burst，使 waitRate 阻塞。
-	e.SetMaxRate(1)
-	e.limiter.WaitN(context.Background(), 64*1024)
+	// 低速 4000 B/s 并耗尽 burst（消费 64KB burst 后令牌池为 0，后续等待需按速率补充）。
+	e.limiter.SetLimit(rate.Limit(4000))
+	e.rateSig.signal()
+	if err := e.limiter.WaitN(context.Background(), 64*1024); err != nil {
+		t.Fatalf("耗尽 burst: %v", err)
+	}
+	// 先设小有限配额 Q1=1000（无在途读，快速排空）。
+	if err := e.SetDailyLimit(0.000001); err != nil {
+		t.Fatal(err)
+	}
 
 	done := make(chan error, 1)
 	go func() { done <- e.readLoop(context.Background(), tgt, 1, body, io.Discard) }()
-	time.Sleep(20 * time.Millisecond) // 进入 waitRate
-	// 旧小配额（100）→ 切无限：重预约读长增大，应补等速率令牌后再进入 Read。
-	e.SetDailyLimit(0.0000001) // 100 字节
-	e.SetMaxRate(0)            // 切无限释放 waitRate
+	// 等 reader 进入首个预约的 waitRate（4000B/s 下 1000B 约 0.25s），期间提高配额。
+	time.Sleep(100 * time.Millisecond)
+	if err := e.SetDailyLimit(0.000008); err != nil { // Q2=8000（更大有限配额）
+		t.Fatal(err)
+	}
+	// 首个迭代重预约读长增大（8000>1000）→ 须补等差额令牌（7000B/4000B/s≈1.75s）后再进入 Read。
+	// 测量配额提高后 300ms 内新增字节：此窗应处于差额令牌等待，几乎不读。
+	before := tgt.total.Load()
+	time.Sleep(300 * time.Millisecond)
+	after := tgt.total.Load()
+	gained := after - before
+	// 速率预算上界：300ms × 4000B/s ≈ 1200B + burst；无 P2（差额 waitRate 移除）会立即读完更大配额。
+	if gained > 4096 {
+		t.Fatalf("重预约读长增大未补等差额令牌: 300ms 内新增 %d", gained)
+	}
+	// 最终应读到真实字节（diff 等待后按更大配额读满）。
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatalf("readLoop 未返回")
 	}
-	// 读取总量不超过速率预算（本次读取有限，不应爆量到 1MB）。
-	if got := tgt.total.Load(); got > 4096*1024 {
-		t.Fatalf("重预约读长增大未受速率约束: %d", got)
+	if tgt.total.Load() == 0 {
+		t.Fatalf("应读到真实字节")
 	}
-	if got := tgt.total.Load(); got == 0 {
-		t.Fatalf("应读取真实字节")
+}
+
+// E1.4：排空超时（配额下调）不得发布新限额、返回 error，旧限额保留。
+func TestE1DrainTimeoutNoPublish(t *testing.T) {
+	e, _ := newTestEngine(t, nil, true)
+	if err := e.SetDailyLimit(0.00001); err != nil { // 先设旧有限 10000
+		t.Fatal(err)
 	}
+	e.quotaSwitchDeadline = 200 * time.Millisecond // 缩短排空期限
+	oldLimit := e.dailyLimit.Load()
+	e.activeConns.Add(1) // 模拟一个永不结算的在途读（使排空超时）
+	err := e.SetDailyLimit(0.0000001)              // 下调 100 → 应排空失败
+	if err == nil {
+		t.Fatalf("排空超时应返回 error")
+	}
+	if e.dailyLimit.Load() != oldLimit {
+		t.Fatalf("排空失败不应发布新限额: %d != %d", e.dailyLimit.Load(), oldLimit)
+	}
+	// 切换失败后旧门禁应恢复（quotaSwitching 复位）。
+	if e.quotaSwitching.Load() {
+		t.Fatalf("切换失败后 quotaSwitching 应复位")
+	}
+	e.activeConns.Add(-1) // 复位模拟
+}
+
+// E1.4：切换中主动 recomputeGate 不得重建 reqCtx（quotaSwitching 纳入 blocked），且无新请求。
+func TestE1RecomputeGateDuringSwitch(t *testing.T) {
+	var reqCount atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqCount.Add(1)
+		w.Write(make([]byte, 16))
+	}))
+	t.Cleanup(srv.Close)
+
+	e, _ := newTestEngine(t, nil, true)
+	createAndHealth(t, e, "x", srv.URL)
+	// 人为保持一次限额切换打开（beginQuotaSwitch 后不立即 end）。
+	if err := e.beginQuotaSwitch(); err != nil {
+		t.Fatal(err)
+	}
+	// 先等取消的在途请求完成（activeConns/probes 归零），再取 base 测量切换窗口无新请求。
+	waitCondition(t, func() bool { return e.activeConns.Load() == 0 && e.probesDrained() }, "切换中在途清空")
+	base := reqCount.Load()
+	// 切换中主动 recomputeGate：blockedFlag 应为 1，reqCtx 保持取消（不得重建），且无新请求。
+	for i := 0; i < 3; i++ {
+		e.recomputeGate()
+		if e.blockedFlag.Load() != 1 {
+			t.Fatalf("切换中 recomputeGate 后 blockedFlag=%d, want 1", e.blockedFlag.Load())
+		}
+		if e.currentReqCtx().Err() == nil {
+			t.Fatalf("切换中 reqCtx 应保持取消（不得重建）")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := reqCount.Load(); got > base {
+		t.Fatalf("切换中产生新请求: %d > %d", got, base)
+	}
+	e.endQuotaSwitch()
+	e.recomputeGate()
+	e.Stop()
 }

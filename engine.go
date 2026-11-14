@@ -172,7 +172,8 @@ type Engine struct {
 	hourBuckets map[int64]*atomic.Int64           // 小时unix->累计绝对值
 	dailyLimit    atomic.Int64                     // 每日字节上限（0=不限）
 	globalTotal   atomic.Int64                     // 全局全量累计（永不清零，供采样）
-	quotaSwitching atomic.Bool                     // P1：限额切换事务中，停新读取准入
+	quotaSwitching   atomic.Bool                    // P1：限额切换事务中，停新读取准入
+	quotaSwitchDeadline time.Duration              // E1：排空期限（测试可调短）
 	reserved     map[string]int64                 // countMu：按日在途预留字节（M1）
 	qVersion     atomic.Uint64                    // 配额状态版本（限速/跨日变更时递增，M3/M1/A2：旧 token 重校验）
 	seq          uint64                           // countMu
@@ -314,6 +315,7 @@ func NewEngine(cfg *Config, store *Store, httpClient *http.Client) (*Engine, err
 		samplerState:   make(map[int64]*sampleState),
 	}
 	e.dailyLimit.Store(int64(cfg.DailyLimitGB * 1e9))
+	e.quotaSwitchDeadline = 10 * time.Second
 	e.notify.init()
 	e.rateSig.init()
 	return e, nil
@@ -811,7 +813,7 @@ func (e *Engine) recomputeGate() {
 		quotaReached = used >= limit // R3：仅实际消费达上限取消在途；预算暂满不取消持有者
 	}
 	e.countMu.Unlock()
-	blocked := e.nonQuotaBlock.Load() || quotaReached
+	blocked := e.nonQuotaBlock.Load() || quotaReached || e.quotaSwitching.Load() // E1：切换期恒阻塞
 	if blocked {
 		e.blockedFlag.Store(1)
 	} else {
@@ -1533,7 +1535,7 @@ func (e *Engine) recomputeGateLockedQuota() {
 		}
 		quotaReached = used >= limit // R3：仅实际消费达上限
 	}
-	blocked := e.nonQuotaBlock.Load() || quotaReached
+	blocked := e.nonQuotaBlock.Load() || quotaReached || e.quotaSwitching.Load() // E1：切换期恒阻塞
 	if blocked {
 		e.blockedFlag.Store(1)
 	} else {
@@ -2525,25 +2527,41 @@ func (e *Engine) SetDailyLimit(gb float64) error {
 	if e.stopped.Load() {
 		return errors.New("engine stopped")
 	}
-	e.applyDailyLimit(int64(gb * 1e9))
+	if err := e.applyDailyLimit(int64(gb * 1e9)); err != nil {
+		return err // E1：排空失败不发布，保留旧配置
+	}
 	e.recomputeGate()
 	return nil
+}
+
+// dailyLimitTightening 判断新限额 b 是否收紧（小项：b>0 且 旧无限 或 新<旧）。
+func (e *Engine) dailyLimitTightening(b int64) bool {
+	oldLimit := e.dailyLimit.Load()
+	return b > 0 && (oldLimit <= 0 || b < oldLimit)
 }
 
 // applyDailyLimit 执行限额切换（P1）：下调/由无限转有限时，先停新准入、取消并等待全部在途读（含
 // 探活与 booked=false 无限令牌）结算，再发布新限额并恢复准入；上调/转无限不排空（旧读不超新预算）。
 // 调用方须已持 adminMu（SetDailyLimit / ApplyConfigUpdate）。
-func (e *Engine) applyDailyLimit(b int64) {
-	oldLimit := e.dailyLimit.Load()
-	tightening := (oldLimit > 0 && b < oldLimit) || (oldLimit <= 0 && b > 0)
+// applyDailyLimit 执行限额切换（P1/E1）：下调时先停准入、取消并等待在途读结算；排空失败则不发布
+// 并恢复旧门禁返回 error。调用方须已持 adminMu。
+func (e *Engine) applyDailyLimit(b int64) error {
+	tightening := e.dailyLimitTightening(b)
 	if tightening {
-		e.beginQuotaSwitch()
-		e.drainInFlightReads()
+		if cerr := e.beginQuotaSwitch(); cerr != nil {
+			e.endQuotaSwitch()
+			return cerr
+		}
+		if err := e.drainInFlightReads(); err != nil {
+			e.endQuotaSwitch() // 排空失败：恢复准入，保留旧限额
+			return err
+		}
 	}
 	e.setDailyLimitBytes(b) // 发布新限额
 	if tightening {
 		e.endQuotaSwitch()
 	}
+	return nil
 }
 
 // setDailyLimitBytes 在 countMu 内更新每日字节上限，并递增配额状态版本（M1：0↔finite 热切换重建账本）。
@@ -2554,11 +2572,11 @@ func (e *Engine) setDailyLimitBytes(b int64) {
 	e.countMu.Unlock()
 }
 
-// beginQuotaSwitch 停新读取准入并取消在途下载/探活（P1）。
-func (e *Engine) beginQuotaSwitch() {
+// beginQuotaSwitch 停新读取准入并取消在途下载/探活（P1/E1）。
+func (e *Engine) beginQuotaSwitch() error {
 	e.quotaSwitching.Store(true)
 	e.setBlocked(true)   // 取消在途 Do/WaitN/Read（F6）并停新下载
-	e.cancelAllProbes()  // 取消在途探活
+	return e.cancelAllProbes() // 取消在途探活
 }
 
 // endQuotaSwitch 恢复准入（P1）。
@@ -2568,14 +2586,20 @@ func (e *Engine) endQuotaSwitch() {
 }
 
 // drainInFlightReads 等待全部在途读（下载 + 探活）结算完毕（P1）。
-func (e *Engine) drainInFlightReads() {
-	deadline := time.Now().Add(10 * time.Second)
+// drainInFlightReads 等待全部在途读（下载 + 探活）结算完毕；超时返回 error（E1：不得发布新限额）。
+func (e *Engine) drainInFlightReads() error {
+	dl := e.quotaSwitchDeadline
+	if dl <= 0 {
+		dl = 10 * time.Second
+	}
+	deadline := time.Now().Add(dl)
 	for time.Now().Before(deadline) {
 		if e.activeConns.Load() == 0 && e.probesDrained() {
-			return
+			return nil
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	return fmt.Errorf("quota switch drain timeout: active=%d probes=%d", e.activeConns.Load(), e.probesInFlightCount())
 }
 
 func (e *Engine) probesDrained() bool {
@@ -2591,7 +2615,7 @@ func (e *Engine) probesInFlightCount() int {
 	return len(e.probeInFlight)
 }
 
-func (e *Engine) cancelAllProbes() {
+func (e *Engine) cancelAllProbes() error {
 	e.probeMu.Lock()
 	ids := make([]int64, 0, len(e.probeInFlight))
 	for id := range e.probeInFlight {
@@ -2599,8 +2623,11 @@ func (e *Engine) cancelAllProbes() {
 	}
 	e.probeMu.Unlock()
 	for _, id := range ids {
-		e.cancelProbe(id)
+		if err := e.cancelProbe(id); err != nil {
+			return err // E1：取消探活失败
+		}
 	}
+	return nil
 }
 
 func (e *Engine) Pause() error {
@@ -2646,14 +2673,33 @@ func (e *Engine) ApplyConfigUpdate(candidate *Config, persist func() error) erro
 	if err := e.precheckStorageDir(candidate.StorageMode); err != nil {
 		return err
 	}
-	if persist != nil {
-		if err := persist(); err != nil {
-			return err // 持久化失败不改运行态（B2）
+	// E1.3：限额下调时先在发布前排空在途读（prepare），再 persist，最后无失败发布；失败均恢复旧运行态。
+	newLimit := int64(candidate.DailyLimitGB * 1e9)
+	tightening := e.dailyLimitTightening(newLimit)
+	if tightening {
+		if cerr := e.beginQuotaSwitch(); cerr != nil {
+			e.endQuotaSwitch()
+			return cerr
+		}
+		if err := e.drainInFlightReads(); err != nil {
+			e.endQuotaSwitch() // 排空失败：不持久化、不发布，保留旧配置
+			return err
 		}
 	}
-	// 发布完整配置。
+	if persist != nil {
+		if err := persist(); err != nil {
+			if tightening {
+				e.endQuotaSwitch() // 保存失败：恢复旧运行参数
+			}
+			return err
+		}
+	}
+	// 发布完整配置（无失败操作）。
 	e.applyRate(candidate.MaxRateMbps)
-	e.applyDailyLimit(int64(candidate.DailyLimitGB * 1e9)) // P1：限额下调事务
+	e.setDailyLimitBytes(newLimit)
+	if tightening {
+		e.endQuotaSwitch()
+	}
 	e.stateMu.Lock()
 	e.maxConns = candidate.MaxConnections
 	e.storageMode = candidate.StorageMode
