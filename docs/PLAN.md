@@ -22,19 +22,19 @@
 | T0 | 引导 | Claude | — | — | ✅ |
 | T1 | 规划与契约审查 | — | Codex | T0 | ✅ REJECT→v2 |
 | T1b | v2 聚焦复审 | — | Codex | v2 | ✅ REJECT→v3 |
-| T1c | v3 聚焦复审（冻结门禁） | — | Codex | v3 | ⬜ |
-| T2 | go.mod + config.go + config.example.yaml | opencode | antigravity（T4） | v3 增量已投递 | 🔄 |
-| T3 | web/index.html + v2/v3 UI 增补 | antigravity | opencode（T6） | — | 🔄 |
-| T4 | 审查 T2 | — | antigravity | T2 完工 | ⬜ |
-| T5 | db.go（Store，签名见 §4 冻结） | opencode | antigravity（T6） | T2 完工 | ⬜ |
-| T6 | 审查 T5 + 审查 T3 | — | antigravity / opencode | T5, T3 完工 | ⬜ |
-| T7 | engine.go（§5 规则 + §8 测试） | opencode | **Codex**（T8） | T6 通过 | ⬜ |
-| T8 | 审查 T7（关键实现独立审查） | — | Codex | T7 | ⬜ |
-| T9 | main.go（路由/组装/关停） | antigravity | opencode（T10） | T8 通过 | ⬜ |
-| T10 | 审查 T9 + 集成冒烟 | — | opencode | T9 | ⬜ |
-| T11 | Dockerfile / compose / CI / README | antigravity | opencode（T12） | T10 通过 | ⬜ |
-| T12 | 审查 T11 + 最终构建验证 | — | opencode | T11 | ⬜ |
-| T13 | 最终验收报告 | Claude | — | T12 | ⬜ |
+| T1c | v3 聚焦复审（冻结门禁） | — | Codex | v3 | ✅ REJECT→v3.1 |
+| T2 | go.mod + config.go + config.example.yaml | opencode | antigravity（T4） | v3 增量已投递 | ✅ |
+| T3 | web/index.html + v2/v3 UI 增补 | antigravity | opencode（T6） | — | ✅ |
+| T4 | 审查 T2 | — | antigravity | T2 完工 | ✅ APPROVE |
+| T5 | db.go（Store，签名见 §4 冻结） | opencode | antigravity（T6） | T2 完工 | ✅ |
+| T6 | 审查 T5 + 审查 T3 | — | antigravity / opencode | T5, T3 完工 | ✅ APPROVE×2 |
+| T7 | engine.go（§5 规则 + §8 测试） | opencode | **Codex**（T8） | T6 通过 | ✅ |
+| T8 | 审查 T7（关键实现独立审查） | — | Codex | T7 | ✅ APPROVE_WITH_MINOR（8轮+润色全闭环） |
+| T9 | main.go（路由/组装/关停） | antigravity | opencode（T10） | T8 通过 | ✅ |
+| T10 | 审查 T9 + 集成冒烟 | — | opencode | T9 | ✅ APPROVE |
+| T11 | Dockerfile / compose / CI / README | antigravity | opencode（T12） | T10 通过 | ✅ |
+| T12 | 审查 T11 + 最终构建验证 | — | opencode | T11 | ✅ APPROVE |
+| T13 | 最终验收报告 | Claude | — | T12 | ✅ 全量+实机冒烟通过 |
 
 ## 2. 全局工程约定
 
