@@ -356,6 +356,16 @@ func TestControlEndpoints(t *testing.T) {
 	if snap.MaxRateMbps != 100 {
 		t.Errorf("running rate should not have changed on persist failure, got %d", snap.MaxRateMbps)
 	}
+
+	// Update with storage directory precheck failure -> 500
+	srv.configPath = configPath // restore valid config path
+	srv.engine.cfg.DiskDir = "/dev/null/cannot/create/dir"
+	req = httptest.NewRequest(http.MethodPost, "/api/control", bytes.NewReader([]byte(`{"action":"update","storage_mode":"disk"}`)))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when precheckStorageDir fails, got %d (%s)", rec.Code, rec.Body.String())
+	}
 }
 
 func TestEnsureConfigFile(t *testing.T) {

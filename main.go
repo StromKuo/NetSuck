@@ -423,19 +423,6 @@ func (s *server) handlePostControl(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		switch candidate.StorageMode {
-		case storageModeMemory:
-			if err := os.MkdirAll(candidate.MemoryDir, 0755); err != nil {
-				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("precheck memory dir %q: %v", candidate.MemoryDir, err))
-				return
-			}
-		case storageModeDisk:
-			if err := os.MkdirAll(candidate.DiskDir, 0755); err != nil {
-				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("precheck disk dir %q: %v", candidate.DiskDir, err))
-				return
-			}
-		}
-
 		var persistErr error
 		err := s.engine.ApplyConfigUpdate(candidate, func() error {
 			persistErr = candidate.Save(s.configPath)
@@ -446,7 +433,7 @@ func (s *server) handlePostControl(w http.ResponseWriter, r *http.Request) {
 				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("persist config failed: %v", persistErr))
 				return
 			}
-			writeJSONError(w, http.StatusBadRequest, err.Error())
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 
