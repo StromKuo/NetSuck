@@ -869,8 +869,8 @@
     function formatBytes(bytes) {
       if (bytes === 0 || !bytes) return '0 B';
       const k = 1000;
-      const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB'];
+      const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), sizes.length - 1);
       return (bytes / Math.pow(k, i)).toFixed(i >= 3 ? 2 : 1) + ' ' + sizes[i];
     }
 
@@ -1033,13 +1033,13 @@
         } else if (t.health === 'RateLimited') {
           const cdText = formatCooldown(t.cooldown_remaining_seconds);
           healthBadge = `
-            <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-amber-50 dark:bg-amber-950/40 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-800" title="${t.error_msg || ''}">
+            <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-amber-50 dark:bg-amber-950/40 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-800" title="${escapeHtml(t.error_msg || '')}">
               <span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>
               限流 ${cdText ? '(' + cdText + ')' : ''}
             </span>`;
         } else if (t.health === 'Dead') {
           healthBadge = `
-            <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-red-50 dark:bg-red-950/40 text-red-600 dark:text-red-400 border border-red-200 dark:border-red-800" title="${t.error_msg || ''}">
+            <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-red-50 dark:bg-red-950/40 text-red-600 dark:text-red-400 border border-red-200 dark:border-red-800" title="${escapeHtml(t.error_msg || '')}">
               <span class="w-1.5 h-1.5 rounded-full bg-red-500"></span>
               失效
             </span>`;
