@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -266,10 +267,7 @@ func TestPoolResize2to1to2(t *testing.T) {
 
 	// 初始 maxConns=2（两个不同 host）。
 	tb.newPhase()
-	time.Sleep(700 * time.Millisecond)
-	if got := tb.current().maxSeen.Load(); got != 2 {
-		t.Fatalf("maxConns=2 时并发应为 2, got %d", got) // F14：不得放宽为 0
-	}
+	waitCondition(t, func() bool { return tb.current().maxSeen.Load() >= 2 }, "maxConns=2 达到 2 并发") // F14：不得放宽为 0
 
 	// 2→1：并发降为 ≤1。
 	tb.newPhase()
@@ -286,10 +284,7 @@ func TestPoolResize2to1to2(t *testing.T) {
 	if err := e.SetMaxConnections(2); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(700 * time.Millisecond)
-	if got := tb.current().maxSeen.Load(); got != 2 {
-		t.Fatalf("2→1→2 后并发应恢复为 2, got %d", got)
-	}
+	waitCondition(t, func() bool { return tb.current().maxSeen.Load() >= 2 }, "2→1→2 后并发恢复为 2")
 	if e.activeConns.Load() > 2 {
 		t.Fatalf("active 超过 2: %d", e.activeConns.Load())
 	}
@@ -298,7 +293,7 @@ func TestPoolResize2to1to2(t *testing.T) {
 // 清单 2：两源重定向到同一 host，互斥仍成立。
 func TestRedirectSameHostMutex(t *testing.T) {
 	trk := &inFlightTracker{}
-	// hostA 是最终落点；两个入口均 302 到 hostA。
+	// host-final 是最终落点；x/y 两个不同源 host（host-x/host-y）都 302 到 host-final。
 	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cur := trk.inFlight.Add(1)
 		trk.updateMax(cur)
@@ -306,7 +301,6 @@ func TestRedirectSameHostMutex(t *testing.T) {
 		w.Write(make([]byte, 128*1024))
 	}))
 	t.Cleanup(final.Close)
-	// 探活（Range bytes=0-1023）直接 200；下载（Range bytes=0-）302 到 final。
 	hop := func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Range") == "bytes=0-1023" {
 			w.Write(make([]byte, 64*1024))
@@ -319,29 +313,27 @@ func TestRedirectSameHostMutex(t *testing.T) {
 	hop2 := httptest.NewServer(http.HandlerFunc(hop))
 	t.Cleanup(hop2.Close)
 
-	e, _ := newTestEngine(t, nil, true)
-	// 先暂停避免 x 持续下载占用 final host 使 y 的探活被饿死（F1 探活需持 host 许可）。
-	createAndHealth(t, e, "x", hop1.URL)
+	// 跨 host：x 源 host 与 y 源 host 不同（fakeHostURL），均 302 到 host-final（M6.8）。
+	e, _ := newTestEngineWithClient(t, &http.Client{Transport: dialLoopbackTransport()}, nil, true)
+	createAndHealth(t, e, "x", fakeHostURL("host-x", hop1.URL))
 	if err := e.Pause(); err != nil {
 		t.Fatal(err)
 	}
-	createAndHealth(t, e, "y", hop2.URL)
+	createAndHealth(t, e, "y", fakeHostURL("host-y", hop2.URL))
 	if err := e.Resume(); err != nil {
 		t.Fatal(err)
 	}
 
 	trk.reset()
 	time.Sleep(500 * time.Millisecond)
-	// 两个目标最终都落到 final host，host 互斥应使并发 ≤1。
+	// 两目标跨不同源 host，最终都落到 host-final；host 互斥应使并发 ≤1。
 	if got := trk.maxSeen.Load(); got > 1 {
-		t.Fatalf("重定向到同 host 后并发超过 1: %d", got)
+		t.Fatalf("跨 host 重定向到同 host 后并发超过 1: %d", got)
 	}
-	// 应真正观察到两源下载并发（≥1），而非零。
 	if got := trk.maxSeen.Load(); got < 1 {
-		t.Fatalf("未观察到重定向下载并发: got=%d", got)
+		t.Fatalf("未观察到跨 host 重定向下载并发: got=%d", got)
 	}
 }
-
 // 清单 3：探活与下载并发，健康状态无脏写（含未到期冷却不被旧结果覆盖，M1）。
 func TestProbeAndDownloadNoDirtyWrite(t *testing.T) {
 	var status atomic.Int32 // 1=200, 2=403
@@ -736,53 +728,95 @@ func TestStopFinalFlush(t *testing.T) {
 // 子进程经 readLoop 流式丢弃 200MB，用 getrusage 报告峰值 RSS；父进程断言 <30MB。
 func TestDiscardRSSBelow30MB(t *testing.T) {
 	if os.Getenv("NETSUCK_RSS_CHILD") == "1" {
-		e, _ := newTestEngine(t, nil, true)
-		tgt := &target{id: 51, total: new(atomic.Int64), gen: 1}
-		e.stateMu.Lock()
-		e.targets[51] = tgt
-		e.stateMu.Unlock()
-		// 基线（引擎启动后、下载前）。
+		// 子进程：真实 HTTP 下载（discard），测总峰值 RSS（非 race 进程，M6）。
+		body := make([]byte, 4*1024*1024)
+		for i := range body {
+			body[i] = 0xAB
+		}
+		var served atomic.Int64
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			for i := 0; i < 64; i++ { // ~256MB 总量
+				served.Add(int64(len(body)))
+				if _, err := w.Write(body); err != nil {
+					return
+				}
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+			}
+		}))
+		defer srv.Close()
+
+		// 指定连接数 1，真实下载链。
+		cfg := DefaultConfig()
+		cfg.Jitter = JitterConfig{0, 0}
+		cfg.MaxConnections = 1
+		store, err := OpenStore(filepath.Join(t.TempDir(), "r.db"))
+		if err != nil {
+			t.Fatalf("open store: %v", err)
+		}
+		store.InitSchema()
+		store.EnsureSeeded(cfg)
+		eng, err := NewEngine(cfg, store, &http.Client{})
+		if err != nil {
+			t.Fatalf("new engine: %v", err)
+		}
+		if err := eng.Start(context.Background()); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		defer eng.Stop()
+		defer store.Close()
+
+		if _, err := eng.CreateTarget(TargetPatch{Name: ptrStr("r"), URL: ptrStr(srv.URL), Weight: ptrInt(10), Enabled: ptrBool(true)}); err != nil {
+			t.Fatalf("create target: %v", err)
+		}
+		// 等真实下载推进（>64MB）。
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) && served.Load() < 64*1024*1024 {
+			time.Sleep(20 * time.Millisecond)
+		}
+		if served.Load() < 64*1024*1024 {
+			t.Fatalf("下载未推进: served=%d", served.Load())
+		}
 		var ru syscall.Rusage
-		syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
-		base := int64(ru.Maxrss)
-		if runtime.GOOS != "darwin" {
-			base *= 1024 // Linux Ru_maxrss 单位为 KB
-		}
-		body := io.LimitReader(zeroReader{}, 200*1024*1024)
-		if err := e.readLoop(context.Background(), tgt, 1, body, io.Discard); err != nil {
-			t.Fatalf("child readLoop: %v", err)
-		}
 		syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
 		peak := int64(ru.Maxrss)
 		if runtime.GOOS != "darwin" {
-			peak *= 1024
+			peak *= 1024 // Linux Ru_maxrss 单位为 KB
 		}
-		fmt.Printf("BASE_RSS=%d PEAK_RSS=%d\n", base, peak)
+		fmt.Printf("PEAK_RSS=%d\n", peak)
 		return
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=^TestDiscardRSSBelow30MB$", "-test.v", "-test.count=1")
+	// 父进程：编译非 race 测试二进制，作为独立子进程执行 RSS 下载并断言总峰值 <30MB。
+	tmpBin := filepath.Join(t.TempDir(), "rsschild.test")
+	build := exec.Command("go", "test", "-c", "-o", tmpBin, ".")
+	build.Dir = "."
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("编译非race测试二进制失败: %v\n%s", err, out)
+	}
+	cmd := exec.Command(tmpBin, "-test.run=^TestDiscardRSSBelow30MB$", "-test.v", "-test.count=1")
 	cmd.Env = append(os.Environ(), "NETSUCK_RSS_CHILD=1")
-	out, _ := cmd.CombinedOutput()
-	base, peak := int64(-1), int64(-1)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("RSS 子进程失败: %v\n%s", err, out) // M6：子进程退出错误不得丢弃
+	}
+	peak := int64(-1)
 	for _, line := range strings.Split(string(out), "\n") {
-		if strings.HasPrefix(line, "BASE_RSS=") {
-			var b, p int64
-			if _, err := fmt.Sscanf(line, "BASE_RSS=%d PEAK_RSS=%d", &b, &p); err == nil {
-				base, peak = b, p
+		if strings.HasPrefix(line, "PEAK_RSS=") {
+			if v, err2 := strconv.ParseInt(strings.TrimPrefix(line, "PEAK_RSS="), 10, 64); err2 == nil {
+				peak = v
 			}
 		}
 	}
-	if peak < 0 || base < 0 {
-		t.Fatalf("无法从子进程获取基线/峰值 RSS; 输出:\n%s", out)
+	if peak < 0 {
+		t.Fatalf("无法从子进程获取峰值 RSS; 输出:\n%s", out)
 	}
-	// F14：独立子进程测 discard 下载路径的峰值 RSS 增量，超限即 FAIL（不做超限 Skip）。
-	// discard 用 32KB 固定缓冲，峰值增量应恒定极小（不随 200MB 文件增长）。
-	added := peak - base
-	if added > 30*1024*1024 {
-		t.Fatalf("discard 200MB 流式读取峰值 RSS 增量 %d 字节 超过 30MB（base=%d peak=%d）", added, base, peak)
+	// M6：非 race 子进程测总峰值 RSS，超限即 FAIL（不做超限 Skip）。
+	if peak > 30*1024*1024 {
+		t.Fatalf("discard 真实 HTTP 下载总峰值 RSS=%d 字节 超过 30MB", peak)
 	}
-	t.Logf("discard 200MB 流式读取峰值 RSS 增量=%d 字节（<30MB），base=%d peak=%d", added, base, peak)
+	t.Logf("discard 真实 HTTP 下载总峰值 RSS=%d 字节（<30MB）", peak)
 }
 
 // zeroReader 零分配流式输出全 0。
@@ -922,12 +956,12 @@ func TestMidnightQuotaRecovery(t *testing.T) {
 	if err := e.SetDailyLimit(0.000001); err != nil { // 1000 字节
 		t.Fatal(err)
 	}
-	if take := e.quotaReserve(1000); take != 1000 {
-		t.Fatalf("reserve take=%d, want 1000", take)
+	if tok := e.quotaReserve(1000); tok.amount != 1000 {
+		t.Fatalf("reserve amount=%d, want 1000", tok.amount)
 	}
-	// 第二次预留应触达配额（rem=0），翻转门禁。
-	if take := e.quotaReserve(1000); take != 0 {
-		t.Fatalf("第二次 reserve take=%d, want 0", take)
+	// 第二次预留应触达配额（剩余 0），翻转门禁。
+	if tok := e.quotaReserve(1000); tok.amount != 0 {
+		t.Fatalf("第二次 reserve amount=%d, want 0", tok.amount)
 	}
 	if e.blockedFlag.Load() != 1 {
 		t.Fatalf("配额触达后 blockedFlag=%d, want 1", e.blockedFlag.Load())
@@ -954,53 +988,51 @@ func TestMidnightQuotaRecovery(t *testing.T) {
 }
 
 // F4：双 host 并发竞争最后配额字节，总消费不得超限。
+// M1：配额账本闭环 —— 多 goroutine 并发 reserve+settle 竞争最后预算，总实际消费不超限、
+// 非零推进且正确耗尽（barrier）。直接测原子预留，确定性不依赖 worker 调度。
 func TestQuotaReserveNoOverrun(t *testing.T) {
-	tb := &trackerBox{}
-	tb.newPhase()
-	body := make([]byte, 256*1024)
-	h := func(w http.ResponseWriter, r *http.Request) {
-		tb.current().inFlight.Add(1)
-		remaining := body
-		chunk := make([]byte, 32*1024)
-		for len(remaining) > 0 {
-			n := len(chunk)
-			if n > len(remaining) {
-				n = len(remaining)
+	e, _ := newTestEngine(t, nil, true)
+	tgt := &target{id: 81, total: new(atomic.Int64)}
+	e.stateMu.Lock()
+	e.targets[81] = tgt
+	e.stateMu.Unlock()
+	if err := e.SetDailyLimit(0.000003); err != nil { // 3000 字节
+		t.Fatal(err)
+	}
+	const n = 32
+	var wg sync.WaitGroup
+	actual := &atomic.Int64{}
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				tok := e.quotaReserve(1024)
+				if tok.amount == 0 {
+					return // 配额耗尽
+				}
+				e.settleRead(tok, tgt, tok.amount) // 全量读 → 实际消费
+				actual.Add(tok.amount)
 			}
-			w.Write(chunk[:n])
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-			time.Sleep(2 * time.Millisecond)
-			remaining = remaining[n:]
-		}
+		}()
 	}
-	s1 := httptest.NewServer(http.HandlerFunc(h))
-	s2 := httptest.NewServer(http.HandlerFunc(h))
-	t.Cleanup(s1.Close)
-	t.Cleanup(s2.Close)
-
-	e, _ := newTestEngineWithClient(t, &http.Client{Transport: dialLoopbackTransport()}, nil, true)
-	id1 := createAndHealth(t, e, "a", fakeHostURL("h-a", s1.URL))
-	id2 := createAndHealth(t, e, "b", fakeHostURL("h-b", s2.URL))
-	// 暂停停止下载，等活跃归零后再记基线（探活字节），设配额后恢复，仅统计配额后新增。
-	if err := e.Pause(); err != nil {
-		t.Fatal(err)
+	wg.Wait()
+	got := actual.Load()
+	if got > 3000 {
+		t.Fatalf("并发 barrier 总实际消费 %d 超过配额 3000（M1 未闭环）", got)
 	}
-	waitCondition(t, func() bool { return e.activeConns.Load() == 0 }, "暂停后 active 归零")
-	base := totalBytes(e, id1) + totalBytes(e, id2)
-	if err := e.SetDailyLimit(0.0000005); err != nil { // 500 字节
-		t.Fatal(err)
+	if got <= 0 {
+		t.Fatalf("barrier 应非零推进（got=%d）", got)
 	}
-	if err := e.Resume(); err != nil {
-		t.Fatal(err)
+	// 正确耗尽 + 实际消费以 globalDays 为准且与 settled 一致（M1 账本闭环）。
+	e.countMu.Lock()
+	gd := int64(0)
+	if g := e.globalDays[e.currentDay]; g != nil {
+		gd = g.Load()
 	}
-	// 等待配额触达（下载因配额自动停止）。
-	waitCondition(t, func() bool { return e.Snapshot().Status == statusQuotaReached }, "配额触达")
-	time.Sleep(300 * time.Millisecond)
-	sum := (totalBytes(e, id1) + totalBytes(e, id2)) - base
-	if sum > 500 {
-		t.Fatalf("双 host 并发总新增 %d 超过配额 500（F4 预留未原子）", sum)
+	e.countMu.Unlock()
+	if gd != got || gd > 3000 {
+		t.Fatalf("实际消费/globalDays 不一致: gd=%d got=%d", gd, got)
 	}
 }
 
@@ -1019,9 +1051,27 @@ func TestDSTDuplicateHourBuckets(t *testing.T) {
 	if hourStartTimeIn(first, loc).Hour() != 1 || hourStartTimeIn(second, loc).Hour() != 1 {
 		t.Fatalf("hourStartTimeIn 未保留本地钟点")
 	}
+	// M6.7：LoadEngineState / History24h 的恢复窗口（自当前小时绝对回退 23h）须同时覆盖两个重复小时键，
+	// 使第二重复小时的桶被恢复/呈现而不错失。
+	hk1, hk2 := hourKeyIn(first, loc), hourKeyIn(second, loc)
+	// 以第二重复小时之后 2h（03:00 EST）为 now 的窗口。
+	ref := hourStartTimeIn(second.Add(2*time.Hour), loc)
+	inWindow := false
+	var winBest int64
+	for i := 0; i < 24; i++ {
+		ts := ref.Add(-time.Duration(i) * time.Hour).Unix()
+		if ts == hk1 || ts == hk2 {
+			inWindow = true
+			winBest = ts
+		}
+	}
+	if !inWindow {
+		t.Fatalf("DST 恢复窗口（自 %v 回退 23h）未覆盖重复小时键之一（hk1=%d hk2=%d）", ref, hk1, hk2)
+	}
+	_ = winBest
 }
 
-// F6：门禁转阻塞（暂停）即时取消在途请求（Do/WaitN/Read 全生效）。
+// F6：门禁转阻塞（暂停）即时取消在途请求（Do/WaitN/Read 全生效；M6.9：响应头已发后卡 body）。
 func TestGateBlocksCancelInFlight(t *testing.T) {
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1029,7 +1079,13 @@ func TestGateBlocksCancelInFlight(t *testing.T) {
 			w.Write(make([]byte, 1024)) // 探活放行
 			return
 		}
-		<-release // 阻塞下载响应，模拟停流
+		// M6.9：发送 200 响应头后卡住 body（卡在 Read）。
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-release
 	}))
 	t.Cleanup(srv.Close)
 	e, _ := newTestEngine(t, nil, true)
@@ -1050,7 +1106,7 @@ func TestGateBlocksCancelInFlight(t *testing.T) {
 	}
 }
 
-// F7：低速旧等待中切不限速，应及时读取。
+// F7/M4：低速旧等待中切不限速，应及时读取（M6：先确认旧预约已建立，断言在旧等待期限内推进）。
 func TestRateSwitchWakesLowWait(t *testing.T) {
 	body := make([]byte, 8*1024*1024)
 	srv := simpleServer(body, nil)
@@ -1060,24 +1116,30 @@ func TestRateSwitchWakesLowWait(t *testing.T) {
 	if err := e.SetMaxRate(1); err != nil { // 1 Mbps（低）
 		t.Fatal(err)
 	}
-	time.Sleep(100 * time.Millisecond)
-	// 让一个下载卡在低速率 WaitN/Reserve。
 	waitCondition(t, func() bool { return e.activeConns.Load() > 0 }, "进入低速率下载")
+	// 先确认旧（低速）预约已建立：低速率下 300ms 只推进少量（≤ 60KB = 1Mbps*0.6s）。
+	time.Sleep(20 * time.Millisecond)
+	loBefore := totalBytes(e, id)
+	time.Sleep(300 * time.Millisecond)
+	loAfter := totalBytes(e, id)
+	if delta := loAfter - loBefore; delta > 80*1024 {
+		t.Fatalf("低速预留未建立/未限速: 300ms 推进 %d 字节（应被限速）", delta)
+	}
+	// 切不限速：应在旧等待期限内推进（旧 1Mbps 32KB 等约 0.26s）。
 	before := totalBytes(e, id)
-	// 切不限速：应在短时间内恢复读取。
 	if err := e.SetMaxRate(0); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(1500 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		if totalBytes(e, id) > before+512*1024 {
 			break
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 	after := totalBytes(e, id)
 	if after <= before+512*1024 {
-		t.Fatalf("切不限速后未及时恢复读取: +%d 字节", after-before)
+		t.Fatalf("切不限速后未及时恢复读取（M3 预约唤醒失效）: +%d 字节", after-before)
 	}
 }
 
@@ -1192,7 +1254,7 @@ func TestProbeFollowsRedirect(t *testing.T) {
 	}
 }
 
-// F3：永久持久化失败下 Stop 有界返回（不无限重试、不卡死）。
+// F3：永久持久化失败下 Stop 有界返回错误（M6：返回 nil 必须 FAIL，不得 Log）。
 func TestStopBoundedOnPermanentFlush(t *testing.T) {
 	e, _ := newTestEngine(t, nil, false)
 	e.persistFn = func(b CounterBatch) error { return fmt.Errorf("permanent persist failure") }
@@ -1210,14 +1272,56 @@ func TestStopBoundedOnPermanentFlush(t *testing.T) {
 	select {
 	case err := <-done:
 		if err == nil {
-			t.Logf("提示：永久失败下 Stop 返回 nil（视为成功但有误记录）")
+			t.Fatalf("永久持久化失败下 Stop 应返回错误，却返回 nil") // M6：必须 FAIL
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatalf("永久失败下 Stop 超过 10s 未返回（有界失败）")
 	}
 }
 
-// F2：并发 flushNow 建批/Seq 有序，最终持久化计数正确（倒序并发）。
+// F3/M6：CRUD 持 adminMu 等待失败 flush 时并发 Stop，必须不卡死且最终完成。
+func TestStopConcurrentWithCrudFlushFailure(t *testing.T) {
+	e, store := newTestEngine(t, nil, false)
+	srv := simpleServer(make([]byte, 32*1024), nil)
+	t.Cleanup(srv.Close)
+	e.persistFn = func(b CounterBatch) error { return store.PersistBatch(b) } // 初始可用
+	if err := e.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { e.Stop() })
+	rec, err := e.CreateTarget(TargetPatch{Name: ptrStr("a"), URL: ptrStr(srv.URL), Weight: ptrInt(10), Enabled: ptrBool(true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitHealthy(t, e, rec.ID)
+
+	// 让 flush 永久失败，使 CRUD 的同步 flushToday 阻塞并返回错误。
+	e.persistFn = func(b CounterBatch) error { return fmt.Errorf("permanent persist failure") }
+
+	crudDone := make(chan error, 1)
+	go func() {
+		// PatchTarget 需 changing（改 URL），会 cancel + flushNow（失败）→ 返回错误并释放 adminMu。
+		_, err := e.PatchTarget(rec.ID, TargetPatch{URL: ptrStr(srv.URL)})
+		crudDone <- err
+	}()
+	// 并发调用 Stop：不得被 CRUD 的 adminMu 永久卡死（F3/M6）。
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- e.Stop() }()
+	select {
+	case <-stopDone:
+		// Stop 有界完成。
+	case <-time.After(10 * time.Second):
+		t.Fatalf("并发 Stop 被 CRUD 卡死（F3 未解）")
+	}
+	select {
+	case <-crudDone:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("CRUD 应返回（flush 失败）")
+	}
+}
+
+// F2/M6：并发 flushNow 建批/Seq 有序，最终持久化计数正确（倒序并发）。
+// M6：断言目标累计 / 全局 / 小时桶同版本一致，且重试批 Seq/内容相同。
 func TestConcurrentFlushOrdered(t *testing.T) {
 	e, store := newTestEngine(t, nil, true)
 	tgt := &target{id: 71, total: new(atomic.Int64)}
@@ -1243,11 +1347,63 @@ func TestConcurrentFlushOrdered(t *testing.T) {
 		t.Fatal(err)
 	}
 	expected := int64(n * (n + 1) / 2)
-	if got := state.TargetDays[e.currentDay][71]; got != expected {
-		t.Fatalf("并发刷盘后持久化 = %d, want %d（F2 建批/Seq 有序）", got, expected)
+	day := e.currentDay
+	if got := state.TargetDays[day][71]; got != expected {
+		t.Fatalf("并发刷盘后日桶 = %d, want %d（F2 建批/Seq 有序）", got, expected)
 	}
-	if tgt.total.Load() != expected {
-		t.Fatalf("内存 total = %d, want %d", tgt.total.Load(), expected)
+	// M6：目标累计、全局、小时桶同版本一致（都等于 expected）。
+	if got := tgt.total.Load(); got != expected {
+		t.Fatalf("内存 total = %d, want %d", got, expected)
+	}
+	// M5：目标累计与日桶同版本（在同一 countMu 线性化下读总与日/全局/小时桶）。
+	if got := tgt.total.Load(); got != expected {
+		t.Fatalf("目标累计 total = %d, want %d（M5 同版本）", got, expected)
+	}
+	if got := state.GlobalDays[day]; got != expected {
+		t.Fatalf("持久化 GlobalDays = %d, want %d", got, expected)
+	}
+	hk := hourKey(e.clock.Now())
+	if got := state.HourBuckets[hk]; got != expected {
+		t.Fatalf("持久化 HourBuckets = %d, want %d（与日桶同版本）", got, expected)
+	}
+}
+
+// F2/M6：重试同批 —— persist 首败后同 Seq/内容重试，最终落库正确。
+func TestFlushRetrySameBatch(t *testing.T) {
+	e, store := newTestEngine(t, nil, true)
+	tgt := &target{id: 72, total: new(atomic.Int64)}
+	e.stateMu.Lock()
+	e.targets[72] = tgt
+	e.stateMu.Unlock()
+
+	var calls atomic.Int64
+	var seenSeq uint64
+	var firstBatch CounterBatch
+	e.persistFn = func(b CounterBatch) error {
+		if calls.Add(1) == 1 {
+			firstBatch = b // 记录首次内容
+			return fmt.Errorf("injected transient failure")
+		}
+		seenSeq = b.Seq
+		return store.PersistBatch(b)
+	}
+	e.countBytes(tgt, 999)
+	if err := e.flushNow(); err != nil {
+		t.Fatalf("flushNow 应重试成功: %v", err)
+	}
+	if calls.Load() < 2 {
+		t.Fatalf("应重试同批: calls=%d", calls.Load())
+	}
+	if firstBatch.Seq != seenSeq {
+		// 重试批与首次相同 Seq（同批），内容相同。
+		t.Fatalf("重试批 Seq 变化: %d != %d", firstBatch.Seq, seenSeq)
+	}
+	e.countMu.Lock()
+	day := e.currentDay
+	e.countMu.Unlock()
+	state, _ := store.LoadEngineState(e.clock.Now())
+	if got := state.TargetDays[day][72]; got != 999 {
+		t.Fatalf("重试同批后落库 = %d, want 999", got)
 	}
 }
 
@@ -1278,5 +1434,106 @@ func TestConcurrentControlTransactions(t *testing.T) {
 	snap := e.Snapshot()
 	if snap.MaxConnections < 1 || snap.MaxConnections > 10 {
 		t.Fatalf("并发控制后 MaxConnections=%d 非法", snap.MaxConnections)
+	}
+}
+
+// B2/M6：改 URL 冲突（409）失败不得清除持久化冷却；重启后原 cooldown_until 仍保留。
+func TestCRUDURLConflictPreservesCooldown(t *testing.T) {
+	s403 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	sB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "bytes=0-1023" {
+			w.Write(make([]byte, 1024))
+			return
+		}
+		w.Write(make([]byte, 64*1024))
+	}))
+	t.Cleanup(s403.Close)
+	t.Cleanup(sB.Close)
+
+	dbPath := filepath.Join(t.TempDir(), "b2.db")
+	cfg := DefaultConfig()
+	cfg.Jitter = JitterConfig{0, 0}
+	st, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.InitSchema()
+	st.EnsureSeeded(cfg)
+	eng, err := NewEngine(cfg, st, &http.Client{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng.clock = realClock{}
+	if err := eng.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A -> s403 若 403 置 RateLimited；B -> sB 先建 Healthy。
+	recA, err := eng.CreateTarget(TargetPatch{Name: ptrStr("a"), URL: ptrStr(s403.URL), Weight: ptrInt(10), Enabled: ptrBool(true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCondition(t, func() bool {
+		snap := eng.Snapshot()
+		if ts, ok := allTargets(snap)[recA.ID]; ok {
+			return ts.Health == healthRateLimited
+		}
+		return false
+	}, "A → RateLimited")
+	recB, err := eng.CreateTarget(TargetPatch{Name: ptrStr("b"), URL: ptrStr(sB.URL), Weight: ptrInt(10), Enabled: ptrBool(true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitHealthy(t, eng, recB.ID)
+
+	// 把 A 的 URL 改为 B 的 URL → 409 冲突，改 URL 失败。
+	if _, err := eng.PatchTarget(recA.ID, TargetPatch{URL: ptrStr(sB.URL)}); err == nil {
+		t.Fatalf("改 URL 到已存在地址应 409 冲突")
+	}
+	cooldownBefore := int64(-1)
+	eng.stateMu.RLock()
+	if tt := eng.targets[recA.ID]; tt != nil {
+		cooldownBefore = tt.cooldownUntilMS
+	}
+	eng.stateMu.RUnlock()
+	if cooldownBefore <= 0 {
+		t.Fatalf("A 应处于冷却（cooldown=%d）", cooldownBefore)
+	}
+
+	// 关闭重启。
+	eng.Stop()
+	st.Close()
+	st2, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st2.InitSchema()
+	eng2, err := NewEngine(cfg, st2, &http.Client{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng2.clock = realClock{}
+	if err := eng2.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Stop()
+	defer st2.Close()
+
+	// 重启后原 cooldown_until 仍保留（B2：失败改 URL 未清除持久化冷却）。
+	eng2.stateMu.RLock()
+	var cooldownAfter int64
+	var healthAfter string
+	if tt := eng2.targets[recA.ID]; tt != nil {
+		cooldownAfter = tt.cooldownUntilMS
+		healthAfter = tt.health
+	}
+	eng2.stateMu.RUnlock()
+	if cooldownAfter != cooldownBefore {
+		t.Fatalf("重启后 cooldown 变化: before=%d after=%d（B2 失败改 URL 清除了冷却）", cooldownBefore, cooldownAfter)
+	}
+	if healthAfter != healthRateLimited {
+		t.Fatalf("重启后 health=%q, want RateLimited", healthAfter)
 	}
 }

@@ -124,15 +124,17 @@ type flushReq struct {
 	done chan error
 }
 
-// Engine 是下载引擎核心。锁序：adminMu > stateMu > countMu > dirtyMu（dirtyMu 为叶）。
+// Engine 是下载引擎核心。锁序：adminMu > stateMu > countMu > dirtyMu（dirtyMu 为叶），
+// targetLockMu / hostMu / reqMu / probeMu 为独立叶锁总在临界区内单独获取不叠于主序上（F15）。
 type Engine struct {
 	cfg        *Config
 	store      *Store
 	persistFn  func(CounterBatch) error // 持久化函数（默认 store.PersistBatch，测试可注入）
 	httpClient *http.Client
 	limiter    *rate.Limiter
-	rateSig    notifySig // F7：限速变化广播，唤醒等待中的预留
-	clock      clock
+	rateSig     notifySig        // F7：限速变化广播，唤醒等待中的预留
+	rateVersion atomic.Uint64    // M3：限速版本，预约前捕获、预约后核对是否变更
+	clock       clock
 
 	adminMu sync.Mutex   // Stop / CRUD / 控制事务门禁（规则 15/18/19）
 	stateMu sync.RWMutex // 目标元数据与运行参数
@@ -151,8 +153,10 @@ type Engine struct {
 	stopped     atomic.Bool
 	blockedFlag atomic.Int32 // 1=被暂停/配额/时段阻塞，0=可运行（规则 6）
 
-	targets   map[int64]*target // stateMu
-	hostLocks map[string]bool   // hostMu
+	targets       map[int64]*target // stateMu
+	targetLockMu  sync.Mutex        // target 许可表（B1）
+	targetLocks   map[int64]bool    // targetLockMu：独占目标整条链（含重定向换 host 与 body 读）
+	hostLocks     map[string]bool   // hostMu
 
 	workers    []*worker // poolMu
 	targetSize int       // poolMu
@@ -162,10 +166,11 @@ type Engine struct {
 	targetDays  map[string]map[int64]*atomic.Int64 // 日->target_id->累计绝对值
 	globalDays  map[string]*atomic.Int64          // 日->全局累计绝对值
 	hourBuckets map[int64]*atomic.Int64           // 小时unix->累计绝对值
-	quotaUsed   atomic.Int64                      // 当前日全局字节镜像（规则 7）
-	dailyLimit  atomic.Int64                      // 每日字节上限（0=不限）
-	globalTotal atomic.Int64                      // 全局全量累计（永不清零，供采样）
-	seq         uint64                            // countMu
+	dailyLimit   atomic.Int64                     // 每日字节上限（0=不限）
+	globalTotal  atomic.Int64                     // 全局全量累计（永不清零，供采样）
+	reserved     map[string]int64                 // countMu：按日在途预留字节（M1）
+	qVersion     uint64                           // countMu：配额状态版本（限速/跨日变更时递增，M3/M1）
+	seq          uint64                           // countMu
 
 	// 脏桶（dirtyMu，值为该条目最近一次标记时的脏纪元，用于成功后才清除 F2）
 	dirtyEpoch   uint64
@@ -271,12 +276,14 @@ func NewEngine(cfg *Config, store *Store, httpClient *http.Client) (*Engine, err
 		limiter:    lim,
 		clock:      realClock{},
 
-		targets:   make(map[int64]*target),
-		hostLocks: make(map[string]bool),
+		targets:      make(map[int64]*target),
+		targetLocks:  make(map[int64]bool),
+		hostLocks:    make(map[string]bool),
 
 		targetDays:  make(map[string]map[int64]*atomic.Int64),
 		globalDays:  make(map[string]*atomic.Int64),
 		hourBuckets: make(map[int64]*atomic.Int64),
+		reserved:    make(map[string]int64),
 
 		dirtyDays:    make(map[string]map[int64]uint64),
 		dirtyGlobal:  make(map[string]uint64),
@@ -357,7 +364,11 @@ func (e *Engine) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	e.lifeCtx, e.lifeCancel = context.WithCancel(context.Background())
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// F16：Start 不忽略传入 ctx —— lifeCtx 派生自调用方 ctx。
+	e.lifeCtx, e.lifeCancel = context.WithCancel(ctx)
 	e.persistCtx, e.persistCancel = context.WithCancel(context.Background())
 	e.reqCtx, e.reqCancel = context.WithCancel(context.Background())
 	e.notify.init()
@@ -393,9 +404,7 @@ func (e *Engine) Start(ctx context.Context) error {
 		a.Store(b)
 		e.hourBuckets[h] = a
 	}
-	if g := e.globalDays[e.currentDay]; g != nil {
-		e.quotaUsed.Store(g.Load())
-	}
+
 
 	// 构建目标计数对象。
 	for _, rec := range state.Targets {
@@ -589,7 +598,12 @@ func (e *Engine) workerLoop(wctx context.Context, w *worker, done chan struct{})
 		if !ok {
 			return
 		}
-		// 记录当前目标以便按目标取消（规则 15）。host 许可由 doWithRedirects 逐跳管理。
+		// B1：独占目标整条链（含重定向换 host 与 body 读取），忙则取消等待改选。
+		if !e.tryAcquireTarget(t.id) {
+			e.notify.wait(wctx)
+			continue
+		}
+		// 记录当前目标以便按目标取消（规则 15）。host 许可由 doRequest 逐跳管理。
 		// F6：请求 ctx 合并 worker ctx 与门禁请求 ctx，转阻塞时即时中止 Do/WaitN/Read。
 		cyc, cycCancel := mergeCtx(wctx, e.currentReqCtx())
 		w.mu.Lock()
@@ -601,6 +615,8 @@ func (e *Engine) workerLoop(wctx context.Context, w *worker, done chan struct{})
 
 		dlErr := e.download(cyc, t)
 
+		e.releaseTarget(t.id)
+
 		// F10：每轮请求结束无条件取消子 ctx，避免 context 泄漏。
 		cycCancel()
 		w.mu.Lock()
@@ -611,7 +627,7 @@ func (e *Engine) workerLoop(wctx context.Context, w *worker, done chan struct{})
 		close(d) // F8：cancelTarget 等待到此为止，不因忙等待而拖延
 
 		if errors.Is(dlErr, errHostBusy) {
-			// F1：忙目标可取消等待（host 释放会 notify 唤醒），禁止 jitter=0 自旋。
+			// F1：忙 host 可取消等待（host 释放会 notify 唤醒），禁止 jitter=0 自旋。
 			e.notify.wait(wctx)
 		}
 
@@ -635,6 +651,24 @@ func (e *Engine) releaseHost(host string) {
 	delete(e.hostLocks, host)
 	e.hostMu.Unlock()
 	e.notify.signal() // F1：host 释放唤醒忙目标等待者
+}
+
+// tryAcquireTarget 独占目标整条请求链（B1）：含重定向换 host 期间与 body 读取直至关闭。
+func (e *Engine) tryAcquireTarget(id int64) bool {
+	e.targetLockMu.Lock()
+	defer e.targetLockMu.Unlock()
+	if e.targetLocks[id] {
+		return false
+	}
+	e.targetLocks[id] = true
+	return true
+}
+
+func (e *Engine) releaseTarget(id int64) {
+	e.targetLockMu.Lock()
+	delete(e.targetLocks, id)
+	e.targetLockMu.Unlock()
+	e.notify.signal()
 }
 
 // selectTarget 选择下载目标；无可选时阻塞等待状态变化（规则 1/6，不忙循环）。
@@ -745,11 +779,17 @@ func (e *Engine) recomputeGate() {
 
 	e.countMu.Lock()
 	e.ensureDay(dayKey(now), now) // F5：主动跨日切换（午夜即使零读取也解除配额）
-	used := e.quotaUsed.Load()
 	limit := e.dailyLimit.Load()
+	quotaReached := false
+	if limit > 0 {
+		used := int64(0)
+		if g := e.globalDays[e.currentDay]; g != nil {
+			used += g.Load()
+		}
+		used += e.reserved[e.currentDay]
+		quotaReached = used >= limit
+	}
 	e.countMu.Unlock()
-
-	quotaReached := limit > 0 && used >= limit
 	blocked := stopped || paused || !inS || quotaReached
 	if blocked {
 		e.blockedFlag.Store(1)
@@ -909,8 +949,9 @@ func (e *Engine) doRequest(ctx context.Context, t *target, gen uint64, kind requ
 	host := normalizeHost(curURL)
 	latency := 0
 	heldHost := ""
+	redirects := 0 // M4：仅真实 3xx 变 URL 时递增，本地忙等待不消耗重定向预算
 
-	for hop := 0; hop <= maxRedirects; hop++ {
+	for {
 		// 发请求前重查准入（规则 1/F1）。
 		if ctx.Err() != nil {
 			e.releaseHost(heldHost)
@@ -928,27 +969,27 @@ func (e *Engine) doRequest(ctx context.Context, t *target, gen uint64, kind requ
 			// 取得 host 许可前先释放已持有（规则 3）。
 			e.releaseHost(heldHost)
 			if kind == kindDownload {
-				return nil, "", latency, errHostBusy // F1：忙目标交回 worker 可取消等待/改选
+				return nil, "", latency, errHostBusy // F1：忙 host 交回 worker 可取消等待/改选
 			}
-			// 探活忙 host：可取消等待短暂后改选（不产生请求、不 spinning）。
+			// 探活忙 host：可取消等待后改选；本地超时视为跳过，不改远端健康（M4）。
 			if !e.notify.wait(ctx) {
-				return nil, "", latency, ctx.Err()
+				if ctx.Err() != nil {
+					return nil, "", latency, errProbeSkipped
+				}
+				continue
 			}
 			continue
 		}
 		heldHost = host
-		released := false
-		release := func() {
-			if !released && heldHost != "" {
-				e.releaseHost(heldHost)
-				released = true
-				heldHost = ""
-			}
+		// B1：取得 host 许可后再复查准入（消除 取许可→发请求 窗口）。
+		if !e.eligible(t.id, gen, kind) {
+			e.releaseHost(heldHost)
+			return nil, "", latency, context.Canceled
 		}
 
 		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, curURL, nil)
 		if rerr != nil {
-			release()
+			e.releaseHost(heldHost)
 			return nil, "", latency, rerr
 		}
 		req.Header.Set("User-Agent", e.userAgentOf())
@@ -956,18 +997,18 @@ func (e *Engine) doRequest(ctx context.Context, t *target, gen uint64, kind requ
 			req.Header.Set("Range", rangeSpec)
 		}
 
-		start := e.clock.Now()
+		start := e.clock.Now() // M4：网络超时从实际发请求起算
 		resp, derr := e.httpClient.Do(req)
 		latency = int(e.clock.Now().Sub(start).Milliseconds())
 		if derr != nil {
-			release()
+			e.releaseHost(heldHost)
 			return nil, "", latency, derr
 		}
 
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 && resp.StatusCode != 304 {
 			loc := resp.Header.Get("Location")
 			_ = resp.Body.Close()
-			release() // 释放旧 host 许可（规则 3）
+			e.releaseHost(heldHost) // 释放旧 host 许可（规则 3）
 			if loc == "" {
 				return nil, "", latency, fmt.Errorf("redirect without location (status %d)", resp.StatusCode)
 			}
@@ -978,13 +1019,15 @@ func (e *Engine) doRequest(ctx context.Context, t *target, gen uint64, kind requ
 			nextURL := resp.Request.URL.ResolveReference(next).String()
 			curURL = nextURL
 			host = normalizeHost(nextURL) // 下一跳取新 host 许可（规则 3）
+			redirects++
+			if redirects > maxRedirects {
+				return nil, "", latency, fmt.Errorf("too many redirects (> %d)", maxRedirects)
+			}
 			continue
 		}
 		// 非重定向：返回响应；host 许可保持持有，由调用方在 body 关闭后释放（规则 3）。
 		return resp, heldHost, latency, nil
 	}
-	e.releaseHost(heldHost)
-	return nil, "", latency, fmt.Errorf("too many redirects (> %d)", maxRedirects)
 }
 
 func (e *Engine) targetGen(id int64) uint64 {
@@ -1083,9 +1126,12 @@ func (e *Engine) openDestination(t *target, mode string) (*dest, error) {
 		if err != nil {
 			return nil, err
 		}
-		// F11：最终文件名唯一（时间戳+随机后缀），避免同 basename 重复/并发下载互相覆盖。
-		uniq := fmt.Sprintf("%s.%d", base, time.Now().UnixNano())
-		return &dest{mode: mode, w: f, file: f, tempPath: f.Name(), finalPath: filepath.Join(dir, uniq)}, nil
+		// F11：最终文件名保留 CreateTemp 的随机后缀（唯一性由 os.CreateTemp 的 * 随机段保证），
+		// 避免同 basename 重复/并发下载互相覆盖。
+		tmpName := filepath.Base(f.Name())
+		finalName := strings.TrimPrefix(tmpName, base+".part-")
+		finalName = base + "." + finalName
+		return &dest{mode: mode, w: f, file: f, tempPath: f.Name(), finalPath: filepath.Join(dir, finalName)}, nil
 	default:
 		return nil, fmt.Errorf("unknown storage mode %q", mode)
 	}
@@ -1147,9 +1193,17 @@ func (e *Engine) waitRate(ctx context.Context, n int) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		// M3：预约前捕获限速版本与信号 channel（不能先 Reserve 再订阅）。
+		ver := e.rateVersion.Load()
+		sigCh := e.rateSig.current()
 		r := e.limiter.ReserveN(time.Now(), n)
 		if !r.OK() {
 			return fmt.Errorf("rate limiter: cannot reserve %d bytes", n)
+		}
+		// 核对预约时是否已变更版本（预约前到预约后的广播）；变了则取消重算。
+		if e.rateVersion.Load() != ver {
+			r.Cancel()
+			continue
 		}
 		delay := r.Delay()
 		if delay <= 0 {
@@ -1157,12 +1211,17 @@ func (e *Engine) waitRate(ctx context.Context, n int) error {
 		}
 		select {
 		case <-time.After(delay):
-			return nil // 等待到期，预约已消费
+			// 等待到期：若期间版本变更则重算，否则视为已消费。
+			if e.rateVersion.Load() != ver {
+				r.Cancel()
+				continue
+			}
+			return nil
 		case <-ctx.Done():
 			r.Cancel()
 			return ctx.Err()
-		case <-e.rateSig.current():
-			r.Cancel() // F7：取消未消费预约，按新值重算
+		case <-sigCh:
+			r.Cancel() // M3：取消未消费预约，按新值重算
 			continue
 		}
 	}
@@ -1178,20 +1237,20 @@ func (e *Engine) readLoop(ctx context.Context, t *target, gen uint64, body io.Re
 		if e.gateBlocked() {
 			return context.Canceled
 		}
-		// F4：Read 前原子预留 min(读长, 剩余额度)；0=配额触达。
-		take := e.quotaReserve(int64(len(buf)))
-		if take == 0 {
+		// M1：Read 前按日预留 min(读长, 剩余额度)；amount==0=配额触达。
+		tok := e.quotaReserve(int64(len(buf)))
+		if tok.amount == 0 {
 			return errQuotaReached
 		}
 		// 令牌桶预约（规则 8：等待在有界 Read 前，≤32KiB≤burst；F7 可取消预约）。
-		if err := e.waitRate(ctx, int(take)); err != nil {
-			e.quotaRefund(take) // F4：取消路径退还全部预留
+		if err := e.waitRate(ctx, int(tok.amount)); err != nil {
+			e.settleRead(tok, t, 0) // 取消路径：归还全部预留，无字节入桶
 			return err
 		}
-		rn, rerr := body.Read(buf[:take])
-		e.quotaSettle(take, int64(rn)) // F4：按实际读数结算，短读/错误退还
+		rn, rerr := body.Read(buf[:tok.amount])
+		// M1：结算=释放对应日未消费预留 + 把实际 rn 归入完成时刻所在日。
+		e.settleRead(tok, t, int64(rn))
 		if rn > 0 {
-			e.countBytes(t, int64(rn)) // 字节归属（规则 9）
 			if _, werr := w.Write(buf[:rn]); werr != nil {
 				return werr
 			}
@@ -1210,6 +1269,9 @@ var errQuotaReached = errors.New("daily quota reached")
 // errHostBusy 表示目标 host 许可被占（F1：忙目标可取消等待或改选，禁止 jitter=0 自旋）。
 var errHostBusy = errors.New("host busy")
 
+// errProbeSkipped 表示探活因本地 host 忙等待超时被跳过（M4：非远端故障，不改健康）。
+var errProbeSkipped = errors.New("probe skipped (local host busy)")
+
 // requestKind 区分下载与探活请求的准入资格（规则 1/F1）。
 type requestKind int
 
@@ -1218,72 +1280,52 @@ const (
 	kindProbe
 )
 
-// quotaReserve 在 countMu 内按日预留可读字节（F4）：0 表示配额触达。
-// 预留记入 quotaUsed 账本（含在途预留），供并发 reader 原子竞争最后额度。
-func (e *Engine) quotaReserve(n int64) int64 {
+// quotaToken 是一次配额预留的令牌（M1）：amount=本次预留可读字节数（0=配额触达），
+// day=预留发生的日，version=预留时的配额状态版本（用于陈旧退款判定）。
+type quotaToken struct {
+	amount  int64
+	day     string
+	version uint64
+}
+
+// currentDayReserved 返回当前日在途预留（在 countMu 内调用）。
+func (e *Engine) currentDayReserved(day string) int64 {
+	return e.reserved[day]
+}
+
+// quotaReserve 在 countMu 内按日预留可读字节（M1）：实际消费以 globalDays 为准，
+// 另维护 per-day 在途 reserved 账本；返回令牌。amount==0 表示配额触达。
+func (e *Engine) quotaReserve(n int64) quotaToken {
 	e.countMu.Lock()
 	defer e.countMu.Unlock()
 	now := e.clock.Now().In(time.Local)
-	e.ensureDay(dayKey(now), now) // 跨日重绑预算（F5）
+	day := dayKey(now)
+	e.ensureDay(day, now) // 跨日重绑预算（F5）
 	limit := e.dailyLimit.Load()
 	if limit <= 0 {
-		return n // 不限
+		return quotaToken{amount: n, day: day, version: e.qVersion} // 不限
 	}
-	used := e.quotaUsed.Load()
-	rem := limit - used
-	if rem <= 0 {
+	used := int64(0)
+	if g := e.globalDays[day]; g != nil {
+		used += g.Load() // 实际消费
+	}
+	used += e.reserved[day]
+	avail := limit - used
+	if avail <= 0 {
 		e.blockedFlag.Store(1) // 配额触达：立即翻转门禁
 		e.notify.signal()
-		return 0
+		return quotaToken{day: day, version: e.qVersion}
 	}
 	take := n
-	if take > rem {
-		take = rem
+	if take > avail {
+		take = avail
 	}
-	e.quotaUsed.Add(take)
-	return take
+	e.reserved[day] += take
+	return quotaToken{amount: take, day: day, version: e.qVersion}
 }
 
-// quotaSettle 按实际读数结算预留：短读部分退还（F4）。take>0 才调用。
-func (e *Engine) quotaSettle(take, rn int64) {
-	if take <= 0 {
-		return
-	}
-	if refund := take - rn; refund > 0 {
-		e.quotaRefund(refund)
-	}
-}
-
-// quotaRefund 退还未消费的预留（取消/短读/错误路径），钳制不低于 0（F4）。
-func (e *Engine) quotaRefund(k int64) {
-	if k <= 0 || e.dailyLimit.Load() <= 0 {
-		return
-	}
-	for {
-		cur := e.quotaUsed.Load()
-		if cur <= 0 {
-			return
-		}
-		refund := k
-		if refund > cur {
-			refund = cur
-		}
-		if e.quotaUsed.CompareAndSwap(cur, cur-refund) {
-			return
-		}
-	}
-}
-
-// countBytes 在计数协调锁内把读取字节归属到日/小时桶并更新总额与配额（规则 9/11）。
-func (e *Engine) countBytes(t *target, n int64) {
-	if n <= 0 {
-		return
-	}
-	e.countMu.Lock()
-	now := e.clock.Now().In(time.Local)
-	day := now.Format("2006-01-02")
-	e.ensureDay(day, now)
-
+// bucketBytes 在 countMu 内把 n 字节归属到当前日/小时桶（M1 结算的一部分，不重取锁）。
+func (e *Engine) bucketBytes(t *target, day string, now time.Time, n int64) {
 	m := e.targetDays[day]
 	if m == nil {
 		m = make(map[int64]*atomic.Int64)
@@ -1295,14 +1337,12 @@ func (e *Engine) countBytes(t *target, n int64) {
 		m[t.id] = b
 	}
 	b.Add(n)
-
 	g := e.globalDays[day]
 	if g == nil {
 		g = new(atomic.Int64)
 		e.globalDays[day] = g
 	}
 	g.Add(n)
-
 	hk := hourKey(now)
 	h := e.hourBuckets[hk]
 	if h == nil {
@@ -1310,37 +1350,77 @@ func (e *Engine) countBytes(t *target, n int64) {
 		e.hourBuckets[hk] = h
 	}
 	h.Add(n)
-
 	t.total.Add(n)
 	e.globalTotal.Add(n)
+	e.markCountDirty(day, t.id, hk)
+}
+
+// settleRead 在 countMu 内一次性结算预留与字节：释放对应日未消费预留，并把实际 rn 字节
+// 归入结算时刻（完成时刻）所在日。跨日完成读按新日结算（M1）。
+func (e *Engine) settleRead(tok quotaToken, t *target, rn int64) {
+	if tok.amount <= 0 {
+		return
+	}
+	e.countMu.Lock()
+	defer e.countMu.Unlock()
+	now := e.clock.Now().In(time.Local)
+	completionDay := dayKey(now)
+	e.ensureDay(completionDay, now)
+	// 释放该令牌的全部预留（回对应预留日；跨日/限速变更后按钳制清账）。
+	// 已读 rn 入 globalDays=实际消费，未读 (tok.amount-rn) 释放后自然回到可用预算（M1 账本闭环）。
+	cur := e.reserved[tok.day]
+	rel := tok.amount
+	if rel > cur {
+		rel = cur
+	}
+	e.reserved[tok.day] = cur - rel
+	if rn > 0 {
+		e.bucketBytes(t, completionDay, now, rn)
+	}
+}
+
+// countBytes 在计数协调锁内把读取字节归属到日/小时桶（无配额预留场景，规则 9；M1 实际消费基准）。
+func (e *Engine) countBytes(t *target, n int64) {
+	if n <= 0 {
+		return
+	}
+	e.countMu.Lock()
+	now := e.clock.Now().In(time.Local)
+	day := dayKey(now)
+	e.ensureDay(day, now)
+	e.bucketBytes(t, day, now, n)
 	e.countMu.Unlock()
 
-	// 标记脏桶（规则 10，F2：脏纪元随标记递增，成功刷盘后才清除）。
-	e.markCountDirty(day, t.id, hk)
-
-	// 配额触达即时翻转门禁（规则 6）。
+	// 配额触达即时翻转门禁（规则 6/M1：以实际消费 globalDays 为准）。
 	limit := e.dailyLimit.Load()
-	if limit > 0 && e.quotaUsed.Load() >= limit && e.blockedFlag.Load() == 0 {
-		e.blockedFlag.Store(1)
-		e.notify.signal()
+	if limit > 0 {
+		e.countMu.Lock()
+		used := int64(0)
+		if g := e.globalDays[day]; g != nil {
+			used = g.Load()
+		}
+		reached := used >= limit
+		e.countMu.Unlock()
+		if reached && e.blockedFlag.Load() == 0 {
+			e.blockedFlag.Store(1)
+			e.notify.signal()
+		}
 	}
 }
 
 // ensureDay 在计数锁内处理跨日切换（规则 11：立即切换配额视图，旧日脏桶保留）。
+// M1：跨日递增配额状态版本，使旧日预留令牌失效；actual 消费以 globalDays 为准，不重置。
 func (e *Engine) ensureDay(day string, now time.Time) {
 	if e.currentDay == day {
 		return
 	}
 	e.currentDay = day
-	if g := e.globalDays[day]; g != nil {
-		e.quotaUsed.Store(g.Load())
-	} else {
-		e.quotaUsed.Store(0)
-	}
+	e.qVersion++ // 旧预留令牌版本失效
 	e.recomputeGateLockedQuota()
 }
 
-// recomputeGateLockedQuota 在已持 countMu 时只重算配额相关的门禁（避免重复取锁）。
+// recomputeGateLockedQuota 在已持 countMu 时只重算配额相关的门禁（避免重复取锁，M1）。
+// quota 是否触达以实际消费 globalDays 与 in-flight 预留之和判定。
 func (e *Engine) recomputeGateLockedQuota() {
 	e.stateMu.RLock()
 	paused := e.paused
@@ -1349,8 +1429,15 @@ func (e *Engine) recomputeGateLockedQuota() {
 	inS := inSchedule(now, e.schedule)
 	e.stateMu.RUnlock()
 	limit := e.dailyLimit.Load()
-	used := e.quotaUsed.Load()
-	quotaReached := limit > 0 && used >= limit
+	quotaReached := false
+	if limit > 0 {
+		used := int64(0)
+		if g := e.globalDays[e.currentDay]; g != nil {
+			used += g.Load()
+		}
+		used += e.reserved[e.currentDay]
+		quotaReached = used >= limit
+	}
 	blocked := stopped || paused || !inS || quotaReached
 	if blocked {
 		e.blockedFlag.Store(1)
@@ -1480,10 +1567,34 @@ func (e *Engine) buildBatch() (*CounterBatch, *dirtySnap) {
 		TargetHealth: make(map[int64]TargetHealthPersist),
 	}
 
-	// countMu 下读计数绝对值 + 分配 Seq（仅持久化协程调用，Seq 串行单调 F2）。
+	// M5：先 stateMu 读健康快照与目标指针，再 countMu 统一读全部计数绝对值（target total 与
+	// 日/全局/小时桶在同一线性化版本），锁序与文件头声明一致（stateMu → countMu 顺序，非嵌套）。
+	e.stateMu.RLock()
+	targetPtrs := make(map[int64]*target, len(snap.targets))
+	for id := range snap.targets {
+		t := e.targets[id]
+		if t == nil {
+			continue
+		}
+		targetPtrs[id] = t
+		batch.TargetHealth[id] = TargetHealthPersist{
+			Health:            t.health,
+			CooldownUntilMS:   t.cooldownUntilMS,
+			LastStatusCode:    t.lastStatusCode,
+			LatencyMS:         t.latencyMS,
+			ErrorMsg:          t.errorMsg,
+			ConsecutiveErrors: t.consecutiveErrors,
+		}
+	}
+	e.stateMu.RUnlock()
+
+	// countMu 下读全部计数绝对值 + TargetTotals + 分配 Seq（仅持久化协程调用，Seq 串行单调 F2）。
 	e.countMu.Lock()
 	e.seq++
 	batch.Seq = e.seq
+	for id, t := range targetPtrs {
+		batch.TargetTotals[id] = t.total.Load()
+	}
 	for day, ids := range snap.days {
 		per := make(map[int64]int64)
 		m := e.targetDays[day]
@@ -1515,25 +1626,6 @@ func (e *Engine) buildBatch() (*CounterBatch, *dirtySnap) {
 		}
 	}
 	e.countMu.Unlock()
-
-	// stateMu 下读目标 total 与健康快照。
-	e.stateMu.RLock()
-	for id := range snap.targets {
-		t := e.targets[id]
-		if t == nil {
-			continue
-		}
-		batch.TargetTotals[id] = t.total.Load()
-		batch.TargetHealth[id] = TargetHealthPersist{
-			Health:            t.health,
-			CooldownUntilMS:   t.cooldownUntilMS,
-			LastStatusCode:    t.lastStatusCode,
-			LatencyMS:         t.latencyMS,
-			ErrorMsg:          t.errorMsg,
-			ConsecutiveErrors: t.consecutiveErrors,
-		}
-	}
-	e.stateMu.RUnlock()
 
 	return batch, snap
 }
@@ -1754,8 +1846,9 @@ func (e *Engine) recordDownloadSuccess(t *target, gen uint64, status, latency in
 
 // cancelTarget 取消指定目标的在途下载并等待结算（规则 13/15）。
 func (e *Engine) cancelTarget(id int64) {
+	// B1：收集并等待该 target 全部下载（不得 break 首个），并取消在途探活。
+	var dones []chan struct{}
 	e.poolMu.Lock()
-	var done chan struct{}
 	for _, w := range e.workers {
 		w.mu.Lock()
 		if w.curID == id {
@@ -1763,16 +1856,14 @@ func (e *Engine) cancelTarget(id int64) {
 				w.curCancel()
 			}
 			if w.cycleDone != nil {
-				done = w.cycleDone
+				dones = append(dones, w.cycleDone)
 			}
-			w.mu.Unlock()
-			break
 		}
 		w.mu.Unlock()
 	}
 	e.poolMu.Unlock()
-	if done != nil {
-		<-done // 等待结算（规则 13/15）
+	for _, d := range dones {
+		<-d // 等待全部结算（规则 13/15）
 	}
 }
 
@@ -1784,8 +1875,9 @@ func (e *Engine) setChanging(id int64, v bool) {
 	e.notify.signal()
 }
 
-// cancelProbe 取消指定目标的在途探活（F8）。取消后探活以 ctx.Canceled 退出且不写健康。
-func (e *Engine) cancelProbe(id int64) {
+// cancelProbe 取消指定目标的在途探活并等待其退出（B1）。
+// 取消后探活以 ctx.Canceled 退出且不写健康。超时返回错误，调用方应阻止 DB 发布。
+func (e *Engine) cancelProbe(id int64) error {
 	e.probeMu.Lock()
 	c := e.probeCancel[id]
 	delete(e.probeCancel, id)
@@ -1800,10 +1892,11 @@ func (e *Engine) cancelProbe(id int64) {
 		_, inflight := e.probeInFlight[id]
 		e.probeMu.Unlock()
 		if !inflight {
-			return
+			return nil
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	return fmt.Errorf("cancel probe %d timed out", id)
 }
 
 // ---- 探活（规则 12） ----
@@ -1835,7 +1928,17 @@ func (e *Engine) probeWorker() {
 			e.probeInFlight[id] = struct{}{}
 			e.probeMu.Unlock()
 
-			e.probeOne(id)
+			// B1：探活独占目标链（与下载互斥）；忙目标则等待许可释放后再探活，避免丢失探活。
+			for {
+				if e.tryAcquireTarget(id) {
+					e.probeOne(id)
+					e.releaseTarget(id)
+					break
+				}
+				if !e.notify.wait(e.lifeCtx) {
+					break // 引擎关闭
+				}
+			}
 
 			e.probeMu.Lock()
 			delete(e.probeInFlight, id)
@@ -1962,26 +2065,26 @@ func (e *Engine) probeNotRemoteFault(err error) bool {
 	if errors.Is(err, context.Canceled) {
 		return true // 引擎/CRUD 取消
 	}
+	if errors.Is(err, errProbeSkipped) {
+		return true // 本地 host 忙等待超时，不改健康（M4）
+	}
 	return false
 }
 
 // probeRead 最多读 probeRange 字节，受令牌桶限速并计入统计。
 func (e *Engine) probeRead(ctx context.Context, t *target, body io.Reader) error {
 	buf := make([]byte, probeRange)
-	// F4：探活同样按日预留-结算-退还。
-	take := e.quotaReserve(int64(len(buf)))
-	if take == 0 {
+	// M1：探活同样按日预留-结算-退还。
+	tok := e.quotaReserve(int64(len(buf)))
+	if tok.amount == 0 {
 		return nil // 配额触达，本次探活不读字节（不影响健康）
 	}
-	if err := e.waitRate(ctx, int(take)); err != nil {
-		e.quotaRefund(take)
+	if err := e.waitRate(ctx, int(tok.amount)); err != nil {
+		e.settleRead(tok, t, 0)
 		return err
 	}
-	n, rerr := body.Read(buf[:take])
-	e.quotaSettle(take, int64(n))
-	if n > 0 {
-		e.countBytes(t, int64(n))
-	}
+	n, rerr := body.Read(buf[:tok.amount])
+	e.settleRead(tok, t, int64(n))
 	if rerr != nil {
 		if rerr == io.EOF {
 			return nil // F9：短响应/空响应读到 EOF 即成功，非远端故障
@@ -2114,14 +2217,14 @@ func (e *Engine) Snapshot() EngineSnapshot {
 	e.countMu.Lock()
 	e.ensureDay(dayKey(now), now)
 	day := e.currentDay
-	ledger := e.quotaUsed.Load() // 预留账本（与门禁一致），判断配额触达
 	used := int64(0)
 	if g := e.globalDays[day]; g != nil {
-		used = g.Load() // 实际消费（不含在途预留），F4/F5：不报昨日桶
+		used = g.Load() // 实际消费（不含在途预留），M1：不报昨日桶
 	}
+	reservedNow := e.reserved[day]
 	e.countMu.Unlock()
 	limit := e.dailyLimit.Load()
-	quotaReached := limit > 0 && ledger >= limit
+	quotaReached := limit > 0 && (used+reservedNow) >= limit
 	if !paused && quotaReached {
 		status = statusQuotaReached
 	} else if !paused && !inSchedule(now, sched) {
@@ -2250,8 +2353,9 @@ func (e *Engine) applyRate(mbps int) {
 	if mbps == 0 {
 		r = rate.Inf
 	}
-	e.limiter.SetLimit(r) // 规则 8：SetLimit 重算
-	e.rateSig.signal()    // F7：广播限速变化，唤醒等待者按新值重算
+	e.limiter.SetLimit(r)          // 规则 8：SetLimit 重算
+	e.rateVersion.Add(1)           // M3：递增限速版本（预约协议核对）
+	e.rateSig.signal()             // F7：广播限速变化，唤醒等待者按新值重算
 }
 
 func (e *Engine) SetMaxConnections(n int) error {
@@ -2298,9 +2402,17 @@ func (e *Engine) SetDailyLimit(gb float64) error {
 	if e.stopped.Load() {
 		return errors.New("engine stopped")
 	}
-	e.dailyLimit.Store(int64(gb * 1e9))
+	e.setDailyLimitBytes(int64(gb * 1e9))
 	e.recomputeGate()
 	return nil
+}
+
+// setDailyLimitBytes 在 countMu 内更新每日字节上限，并递增配额状态版本（M1：0↔finite 热切换重建账本）。
+func (e *Engine) setDailyLimitBytes(b int64) {
+	e.countMu.Lock()
+	e.qVersion++
+	e.dailyLimit.Store(b)
+	e.countMu.Unlock()
 }
 
 func (e *Engine) Pause() error {
@@ -2473,34 +2585,37 @@ func (e *Engine) PatchTarget(id int64, p TargetPatch) (TargetRecord, error) {
 	disabling := p.Enabled != nil && !*p.Enabled
 	needsChanging := urlChanged || disabling
 
-	// 快照旧元数据以便 DB 失败回滚（F8）。
+	// 快照旧元数据以便 DB 失败回滚（F8/M2：stateMu.RLock 内复制值，避免锁外解引用共享 target）。
 	var oldSnap target
-	if t := e.getTarget(id); t != nil {
-		oldSnap = *t
+	e.stateMu.RLock()
+	if t := e.targets[id]; t != nil {
+		oldSnap.id = t.id
+		oldSnap.gen = t.gen
+		oldSnap.host = t.host
+		oldSnap.total = t.total
+		oldSnap.name = t.name
+		oldSnap.url = t.url
+		oldSnap.weight = t.weight
+		oldSnap.enabled = t.enabled
+		oldSnap.health = t.health
+		oldSnap.cooldownUntilMS = t.cooldownUntilMS
+		oldSnap.lastStatusCode = t.lastStatusCode
+		oldSnap.latencyMS = t.latencyMS
+		oldSnap.errorMsg = t.errorMsg
+		oldSnap.consecutiveErrors = t.consecutiveErrors
 	}
+	e.stateMu.RUnlock()
 
-	// F8：仅影响在途工作的变更才需要 changing→取消→清算。
+	// B1/F8：仅影响在途工作的变更才需要 changing→取消→清算。
 	if needsChanging {
-		e.setChanging(id, true)  // 拒准入（下载与探活）
-		e.cancelTarget(id)       // 取消下载并等待结算
-		e.cancelProbe(id)        // 取消在途探活
-
-		// URL 变更：清空旧健康（改 URL 旧健康记录不得落库，F8）。
-		if urlChanged {
-			e.stateMu.Lock()
-			if t := e.targets[id]; t != nil {
-				t.health = healthUnknown
-				t.cooldownUntilMS = 0
-				t.consecutiveErrors = 0
-				t.lastStatusCode = 0
-				t.latencyMS = 0
-				t.errorMsg = ""
-			}
-			e.stateMu.Unlock()
-			e.markTargetDirty(id)
+		e.setChanging(id, true) // 拒准入（下载与探活）
+		e.cancelTarget(id)      // 取消全部下载并等待结算
+		if perr := e.cancelProbe(id); perr != nil { // B1：取消在途探活失败则阻止 DB 发布
+			e.restoreTarget(id, &oldSnap)
+			e.setChanging(id, false)
+			return TargetRecord{}, perr
 		}
-
-		// 清算提交（settle）：已发生流量与（清空后的）健康刷盘。
+		// 清算提交（settle）：保存旧 URL 原健康与已发生计数（B2：不在此清健康）。
 		if err := e.flushNow(); err != nil {
 			e.restoreTarget(id, &oldSnap)
 			e.setChanging(id, false)
@@ -2510,7 +2625,7 @@ func (e *Engine) PatchTarget(id int64, p TargetPatch) (TargetRecord, error) {
 
 	rec, err := e.store.PatchTarget(id, p)
 	if err != nil {
-		// DB 失败：恢复旧目标准入与元数据（已发生流量保留）。
+		// DB 失败：恢复旧目标准入与元数据（F8/B2：持久化未修改，旧健康/冷却保留）。
 		if needsChanging {
 			e.restoreTarget(id, &oldSnap)
 			e.setChanging(id, false)
@@ -2527,6 +2642,13 @@ func (e *Engine) PatchTarget(id int64, p TargetPatch) (TargetRecord, error) {
 		if urlChanged {
 			t.gen++
 			t.host = normalizeHost(rec.URL)
+			// B2：URL 修改提交成功后才清空旧健康并标记脏，供下一批持久化 Unknown。
+			t.health = healthUnknown
+			t.cooldownUntilMS = 0
+			t.consecutiveErrors = 0
+			t.lastStatusCode = 0
+			t.latencyMS = 0
+			t.errorMsg = ""
 		}
 	}
 	if needsChanging {
@@ -2534,6 +2656,9 @@ func (e *Engine) PatchTarget(id int64, p TargetPatch) (TargetRecord, error) {
 	}
 	e.stateMu.Unlock()
 	e.notify.signal()
+	if urlChanged {
+		e.markTargetDirty(id)
+	}
 
 	if urlChanged {
 		e.enqueueProbe(id)
@@ -2620,7 +2745,10 @@ func (e *Engine) DeleteTarget(id int64) error {
 	}
 	e.setChanging(id, true)
 	e.cancelTarget(id) // 取消下载并等待结算
-	e.cancelProbe(id)  // 取消在途探活
+	if perr := e.cancelProbe(id); perr != nil { // B1：取消探活失败阻止 DB 发布
+		e.setChanging(id, false)
+		return perr
+	}
 	if err := e.flushNow(); err != nil { // 清算：历史桶保留
 		e.setChanging(id, false)
 		return err
