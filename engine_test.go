@@ -2087,3 +2087,215 @@ func (r *throttledReader) Read(p []byte) (int, error) {
 	r.sent += int64(n)
 	return n, nil
 }
+
+// P1：限额下调事务取消在途读 —— 无限→有限（真实 HTTP：先发头+16B 再卡 Body，用 inBody 信号确认已进入 Read）。
+func TestP1SetDailyLimitCancelsInFlight(t *testing.T) {
+	inBody := make(chan struct{}, 1)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "bytes=0-1023" { // 探活放行
+			w.Write(make([]byte, 16))
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write(make([]byte, 16)) // 首个下载先读固定 16 字节
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select { case inBody <- struct{}{}: default: } // 已进入 body.Read 信号
+		<-release // 卡住 body，使首个下载在读中
+		// release 后慢速发大 body（新下载按配额读满）。
+		chunk := make([]byte, 4096)
+		for i := 0; i < 128; i++ {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	e, _ := newTestEngine(t, nil, true)
+	id := createAndHealth(t, e, "p1", srv.URL)
+	select {
+	case <-inBody:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("未进入 body.Read")
+	}
+	if e.activeConns.Load() == 0 {
+		t.Fatalf("应已有在途下载")
+	}
+	// 无限→有限 100：事务取消在途读并发布新限额。
+	if err := e.SetDailyLimit(0.0000001); err != nil { // 100 字节
+		t.Fatal(err)
+	}
+	close(release) // 让新下载读大 body
+	// 等待配额触达。
+	waitCondition(t, func() bool { return e.Snapshot().Status == statusQuotaReached }, "新配额触达")
+	time.Sleep(200 * time.Millisecond)
+	e.countMu.Lock()
+	total := int64(0)
+	if g := e.globalDays[e.currentDay]; g != nil {
+		total = g.Load()
+	}
+	e.countMu.Unlock()
+	if total > 100 {
+		t.Fatalf("SetDailyLimit 后总消费 %d 超过 100（P1 未协调在途读）", total)
+	}
+	if total == 0 {
+		t.Fatalf("不应靠'在途字节未交付'统计为 0 通过：应读取真实字节")
+	}
+	// 显式 Stop 关闭下载连接，避免 srv.Close 等待未读 body 的 handler 挂起。
+	_ = id
+	e.Stop()
+}
+
+// P1：有限上限下调 —— 在途读被取消并结算，既有统计保留。
+func TestP1SetDailyLimitFiniteDown(t *testing.T) {
+	inBody := make(chan struct{}, 1)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "bytes=0-1023" {
+			w.Write(make([]byte, 16))
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write(make([]byte, 16))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select { case inBody <- struct{}{}: default: }
+		<-release
+		chunk := make([]byte, 4096)
+		for i := 0; i < 128; i++ {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	e, _ := newTestEngine(t, nil, true)
+	createAndHealth(t, e, "p1d", srv.URL)
+	if err := e.SetDailyLimit(0.00001); err != nil { // 10000
+		t.Fatal(err)
+	}
+	select {
+	case <-inBody:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("未进入 body.Read")
+	}
+	// 有限下调 100：事务取消在途读。
+	if err := e.SetDailyLimit(0.0000001); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	waitCondition(t, func() bool { return e.Snapshot().Status == statusQuotaReached }, "下调后配额触达")
+	time.Sleep(200 * time.Millisecond)
+	e.countMu.Lock()
+	total := int64(0)
+	if g := e.globalDays[e.currentDay]; g != nil {
+		total = g.Load()
+	}
+	e.countMu.Unlock()
+	if total > 100 {
+		t.Fatalf("有限下调后总消费 %d 超过 100", total)
+	}
+	if total == 0 {
+		t.Fatalf("不应靠统计为 0 通过")
+	}
+	e.Stop()
+}
+
+// P1：限额下调事务取消在途探活（probeRead 也在读，须被取消并结算）。
+func TestP1SetDailyLimitCancelsProbe(t *testing.T) {
+	inProbeBody := make(chan struct{}, 1)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "bytes=0-1023" { // 探活：头+几字节后卡 body
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.WriteHeader(http.StatusOK)
+			w.Write(make([]byte, 16))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			select { case inProbeBody <- struct{}{}: default: } // 探活已进入 body.Read
+			<-release
+			return
+		}
+		w.Write(make([]byte, 16)) // 下载放行
+	}))
+	t.Cleanup(srv.Close)
+
+	e, _ := newTestEngine(t, nil, true)
+	if _, err := e.CreateTarget(TargetPatch{Name: ptrStr("p1p"), URL: ptrStr(srv.URL), Weight: ptrInt(10), Enabled: ptrBool(true)}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-inProbeBody:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("探活未进入 body.Read")
+	}
+	if e.probesInFlightCount() == 0 {
+		t.Fatalf("应已有在途探活")
+	}
+	// 无限→有限 100：事务取消在途探活。
+	if err := e.SetDailyLimit(0.0000001); err != nil {
+		t.Fatal(err)
+	}
+	waitCondition(t, func() bool { return e.probesInFlightCount() == 0 }, "探活被取消并结算")
+	// 探活被取消不应置 Dead（本地原因，不改健康）。
+	e.stateMu.RLock()
+	health := ""
+	if tgt := e.targets[1]; tgt != nil {
+		health = tgt.health
+	}
+	e.stateMu.RUnlock()
+	if health == healthDead {
+		t.Fatalf("探活被取消不应置 Dead")
+	}
+	close(release)
+	e.Stop()
+}
+
+// P2：重预约读长增大时补等速率令牌——低速下旧小配额→切无限，本次读取不超过速率预算。
+func TestP2ReReserveLargerReWaitsRate(t *testing.T) {
+	e, _ := newTestEngine(t, nil, true)
+	tgt := &target{id: 120, total: new(atomic.Int64)}
+	e.stateMu.Lock()
+	e.targets[120] = tgt
+	e.stateMu.Unlock()
+	body := io.LimitReader(zeroReader{}, 1<<20) // 1MB
+
+	// 低速（1Mbps）并耗尽 burst，使 waitRate 阻塞。
+	e.SetMaxRate(1)
+	e.limiter.WaitN(context.Background(), 64*1024)
+
+	done := make(chan error, 1)
+	go func() { done <- e.readLoop(context.Background(), tgt, 1, body, io.Discard) }()
+	time.Sleep(20 * time.Millisecond) // 进入 waitRate
+	// 旧小配额（100）→ 切无限：重预约读长增大，应补等速率令牌后再进入 Read。
+	e.SetDailyLimit(0.0000001) // 100 字节
+	e.SetMaxRate(0)            // 切无限释放 waitRate
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("readLoop 未返回")
+	}
+	// 读取总量不超过速率预算（本次读取有限，不应爆量到 1MB）。
+	if got := tgt.total.Load(); got > 4096*1024 {
+		t.Fatalf("重预约读长增大未受速率约束: %d", got)
+	}
+	if got := tgt.total.Load(); got == 0 {
+		t.Fatalf("应读取真实字节")
+	}
+}

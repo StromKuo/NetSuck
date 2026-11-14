@@ -170,8 +170,9 @@ type Engine struct {
 	targetDays  map[string]map[int64]*atomic.Int64 // 日->target_id->累计绝对值
 	globalDays  map[string]*atomic.Int64          // 日->全局累计绝对值
 	hourBuckets map[int64]*atomic.Int64           // 小时unix->累计绝对值
-	dailyLimit   atomic.Int64                     // 每日字节上限（0=不限）
-	globalTotal  atomic.Int64                     // 全局全量累计（永不清零，供采样）
+	dailyLimit    atomic.Int64                     // 每日字节上限（0=不限）
+	globalTotal   atomic.Int64                     // 全局全量累计（永不清零，供采样）
+	quotaSwitching atomic.Bool                     // P1：限额切换事务中，停新读取准入
 	reserved     map[string]int64                 // countMu：按日在途预留字节（M1）
 	qVersion     atomic.Uint64                    // 配额状态版本（限速/跨日变更时递增，M3/M1/A2：旧 token 重校验）
 	seq          uint64                           // countMu
@@ -1080,11 +1081,11 @@ func (e *Engine) gateBlocked() bool { return e.blockedFlag.Load() != 0 }
 func (e *Engine) setBlocked(blocked bool) {
 	e.reqMu.Lock()
 	if blocked {
+		// 取消 reqCtx 但保留之（不置 nil），使切换/暂停期间新建的下载也继承已取消 ctx，立即被中止。
 		if e.reqCancel != nil {
 			e.reqCancel()
 		}
-		e.reqCtx, e.reqCancel = nil, nil
-	} else if e.reqCtx == nil {
+	} else if e.reqCtx == nil || e.reqCtx.Err() != nil {
 		e.reqCtx, e.reqCancel = context.WithCancel(context.Background())
 	}
 	e.reqMu.Unlock()
@@ -1295,11 +1296,20 @@ func (e *Engine) readLoop(ctx context.Context, t *target, gen uint64, body io.Re
 			e.settleRead(tok, t, 0) // 取消路径：归还全部预留，无字节入桶
 			return err
 		}
-		// U1：版本校验/重预约移到 waitRate 结束后、紧邻实际 Read —— 限额/跨日在等待期间变化时，
-		// 释放旧预留并按当前预算重预约，再据新读长读取。
+		// U1/P2：版本校验/重预约移到 waitRate 结束后、紧邻实际 Read —— 限额/跨日在等待期间变化时，
+		// 释放旧预留并按当前预算重预约；若新读长增大则补等相应速率令牌（完整重试协议），再进入 Read。
+		rateBudget := tok.amount // 已为该量等待过速率令牌
 		for tok.amount != 0 && tok.version != e.quotaVersion() {
 			e.releaseTokenBooking(tok)
 			tok = e.quotaReserve(int64(len(buf)))
+			if tok.amount > rateBudget {
+				// 新读长增大：补等差额令牌后再进入 Read（P2）。
+				if err := e.waitRate(ctx, int(tok.amount-rateBudget)); err != nil {
+					e.settleRead(tok, t, 0)
+					return err
+				}
+			}
+			rateBudget = tok.amount
 		}
 		if tok.amount == 0 {
 			return errQuotaReached
@@ -1359,6 +1369,9 @@ func (e *Engine) quotaReserve(n int64) quotaToken {
 	now := e.clock.Now().In(time.Local)
 	day := dayKey(now)
 	e.ensureDay(day, now) // 跨日重绑预算（F5）
+	if e.quotaSwitching.Load() {
+		return quotaToken{day: day, version: e.qVersion.Load()} // P1：切换中停新准入
+	}
 	limit := e.dailyLimit.Load()
 	if limit <= 0 {
 		return quotaToken{amount: n, day: day, version: e.qVersion.Load()} // 不限：不预留、结算不退他人预留（R3）
@@ -2178,10 +2191,18 @@ func (e *Engine) probeRead(ctx context.Context, t *target, body io.Reader) error
 		e.settleRead(tok, t, 0)
 		return err
 	}
-	// U1：版本校验/重预约移到 waitRate 后、紧邻实际 Read。
+	// U1/P2：版本校验/重预约移到 waitRate 后、紧邻实际 Read；新读长增大补等速率令牌。
+	rateBudget := tok.amount
 	for tok.amount != 0 && tok.version != e.quotaVersion() {
 		e.releaseTokenBooking(tok)
 		tok = e.quotaReserve(int64(len(buf)))
+		if tok.amount > rateBudget {
+			if err := e.waitRate(ctx, int(tok.amount-rateBudget)); err != nil {
+				e.settleRead(tok, t, 0)
+				return err
+			}
+		}
+		rateBudget = tok.amount
 	}
 	if tok.amount == 0 {
 		return nil // 配额触达，本次探活不读字节（不影响健康）
@@ -2504,9 +2525,25 @@ func (e *Engine) SetDailyLimit(gb float64) error {
 	if e.stopped.Load() {
 		return errors.New("engine stopped")
 	}
-	e.setDailyLimitBytes(int64(gb * 1e9))
+	e.applyDailyLimit(int64(gb * 1e9))
 	e.recomputeGate()
 	return nil
+}
+
+// applyDailyLimit 执行限额切换（P1）：下调/由无限转有限时，先停新准入、取消并等待全部在途读（含
+// 探活与 booked=false 无限令牌）结算，再发布新限额并恢复准入；上调/转无限不排空（旧读不超新预算）。
+// 调用方须已持 adminMu（SetDailyLimit / ApplyConfigUpdate）。
+func (e *Engine) applyDailyLimit(b int64) {
+	oldLimit := e.dailyLimit.Load()
+	tightening := (oldLimit > 0 && b < oldLimit) || (oldLimit <= 0 && b > 0)
+	if tightening {
+		e.beginQuotaSwitch()
+		e.drainInFlightReads()
+	}
+	e.setDailyLimitBytes(b) // 发布新限额
+	if tightening {
+		e.endQuotaSwitch()
+	}
 }
 
 // setDailyLimitBytes 在 countMu 内更新每日字节上限，并递增配额状态版本（M1：0↔finite 热切换重建账本）。
@@ -2515,6 +2552,55 @@ func (e *Engine) setDailyLimitBytes(b int64) {
 	e.qVersion.Add(1)
 	e.dailyLimit.Store(b)
 	e.countMu.Unlock()
+}
+
+// beginQuotaSwitch 停新读取准入并取消在途下载/探活（P1）。
+func (e *Engine) beginQuotaSwitch() {
+	e.quotaSwitching.Store(true)
+	e.setBlocked(true)   // 取消在途 Do/WaitN/Read（F6）并停新下载
+	e.cancelAllProbes()  // 取消在途探活
+}
+
+// endQuotaSwitch 恢复准入（P1）。
+func (e *Engine) endQuotaSwitch() {
+	e.quotaSwitching.Store(false)
+	e.setBlocked(false)
+}
+
+// drainInFlightReads 等待全部在途读（下载 + 探活）结算完毕（P1）。
+func (e *Engine) drainInFlightReads() {
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if e.activeConns.Load() == 0 && e.probesDrained() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func (e *Engine) probesDrained() bool {
+	e.probeMu.Lock()
+	defer e.probeMu.Unlock()
+	return len(e.probeInFlight) == 0 && len(e.probePending) == 0
+}
+
+// probesInFlightCount 返回在途探活数（测试/诊断用）。
+func (e *Engine) probesInFlightCount() int {
+	e.probeMu.Lock()
+	defer e.probeMu.Unlock()
+	return len(e.probeInFlight)
+}
+
+func (e *Engine) cancelAllProbes() {
+	e.probeMu.Lock()
+	ids := make([]int64, 0, len(e.probeInFlight))
+	for id := range e.probeInFlight {
+		ids = append(ids, id)
+	}
+	e.probeMu.Unlock()
+	for _, id := range ids {
+		e.cancelProbe(id)
+	}
 }
 
 func (e *Engine) Pause() error {
@@ -2567,7 +2653,7 @@ func (e *Engine) ApplyConfigUpdate(candidate *Config, persist func() error) erro
 	}
 	// 发布完整配置。
 	e.applyRate(candidate.MaxRateMbps)
-	e.dailyLimit.Store(int64(candidate.DailyLimitGB * 1e9))
+	e.applyDailyLimit(int64(candidate.DailyLimitGB * 1e9)) // P1：限额下调事务
 	e.stateMu.Lock()
 	e.maxConns = candidate.MaxConnections
 	e.storageMode = candidate.StorageMode
