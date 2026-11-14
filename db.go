@@ -348,6 +348,76 @@ func (s *Store) PatchTarget(id int64, p TargetPatch) (TargetRecord, error) {
 	return s.getLiveTarget(ctx, s.db, id)
 }
 
+// PatchTargetAtomic 在单个 DB 事务内更新目标字段并在 resetHealth=true 时原子重置健康
+//（health='Unknown', cooldown_until_ms=0, consecutive_errors=0, status/latency/error 清空），
+// 供改 URL 时 URL 变更与健康重置同事务提交（R2：避免"先清健康成功→再改 URL"的崩溃窗口）。
+// 返回更新后的 TargetRecord；重复 url（未软删）→ ErrDuplicateURL。
+func (s *Store) PatchTargetAtomic(id int64, p TargetPatch, resetHealth bool) (TargetRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ctx := context.Background()
+
+	sets := make([]string, 0, 6)
+	args := make([]any, 0, 6)
+	if p.Name != nil {
+		sets = append(sets, "name = ?")
+		args = append(args, *p.Name)
+	}
+	if p.URL != nil {
+		sets = append(sets, "url = ?")
+		args = append(args, *p.URL)
+	}
+	if p.Weight != nil {
+		sets = append(sets, "weight = ?")
+		args = append(args, *p.Weight)
+	}
+	if p.Enabled != nil {
+		sets = append(sets, "enabled = ?")
+		args = append(args, boolToInt(*p.Enabled))
+	}
+	if resetHealth {
+		sets = append(sets,
+			"health = ?", "cooldown_until_ms = ?", "consecutive_errors = ?",
+			"last_status_code = ?", "latency_ms = ?", "error_msg = ?")
+		args = append(args, "Unknown", int64(0), 0, 0, int64(0), "")
+	}
+
+	if len(sets) == 0 {
+		return s.getLiveTarget(ctx, s.db, id)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return TargetRecord{}, fmt.Errorf("db: patch atomic begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	args = append(args, id)
+	res, err := tx.ExecContext(ctx,
+		`UPDATE targets SET `+strings.Join(sets, ", ")+` WHERE id = ? AND deleted_at IS NULL`, args...)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return TargetRecord{}, ErrDuplicateURL
+		}
+		return TargetRecord{}, fmt.Errorf("db: patch atomic %d: %w", id, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return TargetRecord{}, fmt.Errorf("db: patch atomic %d: %w", id, err)
+	}
+	if affected == 0 {
+		return TargetRecord{}, ErrNotFound
+	}
+	rec, err := s.getLiveTarget(ctx, tx, id)
+	if err != nil {
+		return TargetRecord{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return TargetRecord{}, fmt.Errorf("db: patch atomic commit: %w", err)
+	}
+	return rec, nil
+}
+
 // SoftDeleteTarget 软删一条目标（保留历史统计）。deleted_at 存 Unix 毫秒。
 // 不存在或已软删返回 ErrNotFound。
 func (s *Store) SoftDeleteTarget(id int64) error {

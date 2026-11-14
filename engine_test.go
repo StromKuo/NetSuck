@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -764,8 +765,13 @@ func TestDiscardRSSBelow30MB(t *testing.T) {
 		if err := eng.Start(context.Background()); err != nil {
 			t.Fatalf("start: %v", err)
 		}
-		defer eng.Stop()
-		defer store.Close()
+		// RSS：先 Stop（其错误不得忽略）再 Close store（避免顺序颠倒导致 DB 不一致）。
+		defer func() {
+			if serr := eng.Stop(); serr != nil {
+				t.Errorf("RSS child Stop: %v", serr)
+			}
+			store.Close()
+		}()
 
 		if _, err := eng.CreateTarget(TargetPatch{Name: ptrStr("r"), URL: ptrStr(srv.URL), Weight: ptrInt(10), Enabled: ptrBool(true)}); err != nil {
 			t.Fatalf("create target: %v", err)
@@ -956,15 +962,19 @@ func TestMidnightQuotaRecovery(t *testing.T) {
 	if err := e.SetDailyLimit(0.000001); err != nil { // 1000 字节
 		t.Fatal(err)
 	}
-	if tok := e.quotaReserve(1000); tok.amount != 1000 {
-		t.Fatalf("reserve amount=%d, want 1000", tok.amount)
+	tok := e.quotaReserve(1000)
+	if tok.amount != 1000 || !tok.booked {
+		t.Fatalf("reserve amount=%d booked=%v, want 1000/true", tok.amount, tok.booked)
 	}
-	// 第二次预留应触达配额（剩余 0），翻转门禁。
-	if tok := e.quotaReserve(1000); tok.amount != 0 {
-		t.Fatalf("第二次 reserve amount=%d, want 0", tok.amount)
+	// 结算成全量实际消费 → globalDays=1000=limit（真实达上限，R3 才翻转门禁）。
+	e.settleRead(tok, tgt, 1000)
+	// 新预留此时被阻断（amount 0）。
+	if ntok := e.quotaReserve(1000); ntok.amount != 0 {
+		t.Fatalf("达上限后新预留 amount=%d, want 0", ntok.amount)
 	}
+	e.recomputeGate()
 	if e.blockedFlag.Load() != 1 {
-		t.Fatalf("配额触达后 blockedFlag=%d, want 1", e.blockedFlag.Load())
+		t.Fatalf("真实达上限后 blockedFlag=%d, want 1", e.blockedFlag.Load())
 	}
 	// 快进跨午夜，零读取。
 	clk.advance(2 * time.Minute)
@@ -1051,24 +1061,69 @@ func TestDSTDuplicateHourBuckets(t *testing.T) {
 	if hourStartTimeIn(first, loc).Hour() != 1 || hourStartTimeIn(second, loc).Hour() != 1 {
 		t.Fatalf("hourStartTimeIn 未保留本地钟点")
 	}
-	// M6.7：LoadEngineState / History24h 的恢复窗口（自当前小时绝对回退 23h）须同时覆盖两个重复小时键，
-	// 使第二重复小时的桶被恢复/呈现而不错失。
-	hk1, hk2 := hourKeyIn(first, loc), hourKeyIn(second, loc)
-	// 以第二重复小时之后 2h（03:00 EST）为 now 的窗口。
-	ref := hourStartTimeIn(second.Add(2*time.Hour), loc)
-	inWindow := false
-	var winBest int64
-	for i := 0; i < 24; i++ {
-		ts := ref.Add(-time.Duration(i) * time.Hour).Unix()
-		if ts == hk1 || ts == hk2 {
-			inWindow = true
-			winBest = ts
+
+	// 用本地时区为 DST 区、且引擎未 Start（无运行协程）构造计数与恢复验证，避免改全局 time.Local 竞争。
+	oldLocal := time.Local
+	time.Local = loc
+	defer func() { time.Local = oldLocal }()
+	clk := &fakeClock{now: first}
+	e, store := newTestEngine(t, clk, false) // 不 Start，无 goroutine
+	tgt := &target{id: 55, total: new(atomic.Int64)}
+	e.stateMu.Lock()
+	e.targets[55] = tgt
+	e.stateMu.Unlock()
+	e.countBytes(tgt, 100) // 01:30 EDT → hk1
+	clk.advance(time.Hour) // 01:30 EST
+	e.countBytes(tgt, 200) // 01:30 EST → hk2
+	hk1 := hourKey(first)
+	hk2 := hourKey(second)
+	if hk1 == hk2 {
+		t.Fatalf("countBytes 后两键仍相同")
+	}
+
+	// History24h 窗口（自 second 之后 2h=03:00 EST）须呈现第二重复小时的桶值。
+	ref := second.Add(3 * time.Hour) // 04:30 EST（完全错开重复小时）
+	hist, err := e.History24h(ref)
+	if err != nil {
+		t.Fatalf("History24h: %v", err)
+	}
+	found1, found2 := false, false
+	for _, p := range hist {
+		if p.HourUnix == hk1 && p.Bytes == 100 {
+			found1 = true
+		}
+		if p.HourUnix == hk2 && p.Bytes == 200 {
+			found2 = true
 		}
 	}
-	if !inWindow {
-		t.Fatalf("DST 恢复窗口（自 %v 回退 23h）未覆盖重复小时键之一（hk1=%d hk2=%d）", ref, hk1, hk2)
+	if !found1 || !found2 {
+		t.Fatalf("History24h 恢复窗口未同时呈现两重复小时桶: hk1=%v hk2=%v", found1, found2)
 	}
-	_ = winBest
+
+	// 持久化后 LoadEngineState 在重复小时窗口恢复两桶（第二重复小时桶不丢失）。
+	e.countMu.Lock()
+	v1, v2 := int64(0), int64(0)
+	if b := e.hourBuckets[hk1]; b != nil {
+		v1 = b.Load()
+	}
+	if b := e.hourBuckets[hk2]; b != nil {
+		v2 = b.Load()
+	}
+	e.countMu.Unlock()
+	err = store.PersistBatch(CounterBatch{
+		HourBuckets: map[int64]int64{hk1: v1, hk2: v2},
+		Seq:         1,
+	})
+	if err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	restored, err := store.LoadEngineState(ref)
+	if err != nil {
+		t.Fatalf("LoadEngineState: %v", err)
+	}
+	if restored.HourBuckets[hk1] != 100 || restored.HourBuckets[hk2] != 200 {
+		t.Fatalf("LoadEngineState 未恢复两重复小时桶: hk1=%d hk2=%d", restored.HourBuckets[hk1], restored.HourBuckets[hk2])
+	}
 }
 
 // F6：门禁转阻塞（暂停）即时取消在途请求（Do/WaitN/Read 全生效；M6.9：响应头已发后卡 body）。
@@ -1125,12 +1180,12 @@ func TestRateSwitchWakesLowWait(t *testing.T) {
 	if delta := loAfter - loBefore; delta > 80*1024 {
 		t.Fatalf("低速预留未建立/未限速: 300ms 推进 %d 字节（应被限速）", delta)
 	}
-	// 切不限速：应在旧等待期限内推进（旧 1Mbps 32KB 等约 0.26s）。
+	// 切不限速：应在旧等待期限内推进（旧 1Mbps 32KB 等约 0.26s），deadline 收紧以证明即时性。
 	before := totalBytes(e, id)
 	if err := e.SetMaxRate(0); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(1500 * time.Millisecond)
+	deadline := time.Now().Add(700 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		if totalBytes(e, id) > before+512*1024 {
 			break
@@ -1282,29 +1337,43 @@ func TestStopBoundedOnPermanentFlush(t *testing.T) {
 // F3/M6：CRUD 持 adminMu 等待失败 flush 时并发 Stop，必须不卡死且最终完成。
 func TestStopConcurrentWithCrudFlushFailure(t *testing.T) {
 	e, store := newTestEngine(t, nil, false)
-	srv := simpleServer(make([]byte, 32*1024), nil)
-	t.Cleanup(srv.Close)
+	s1 := simpleServer(make([]byte, 32*1024), nil)
+	s2 := simpleServer(make([]byte, 32*1024), nil)
+	t.Cleanup(s1.Close)
+	t.Cleanup(s2.Close)
 	e.persistFn = func(b CounterBatch) error { return store.PersistBatch(b) } // 初始可用
 	if err := e.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { e.Stop() })
-	rec, err := e.CreateTarget(TargetPatch{Name: ptrStr("a"), URL: ptrStr(srv.URL), Weight: ptrInt(10), Enabled: ptrBool(true)})
+	rec, err := e.CreateTarget(TargetPatch{Name: ptrStr("a"), URL: ptrStr(s1.URL), Weight: ptrInt(10), Enabled: ptrBool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	waitHealthy(t, e, rec.ID)
 
-	// 让 flush 永久失败，使 CRUD 的同步 flushToday 阻塞并返回错误。
-	e.persistFn = func(b CounterBatch) error { return fmt.Errorf("permanent persist failure") }
+	// 永久失败的 persistFn 且发出信号，确认 CRUD 已进入失败 flush 再并发 Stop。
+	flushStarted := make(chan struct{}, 8)
+	var fail atomic.Int64
+	e.persistFn = func(b CounterBatch) error {
+		fail.Add(1)
+		select { case flushStarted <- struct{}{}: default: }
+		return fmt.Errorf("permanent persist failure")
+	}
 
 	crudDone := make(chan error, 1)
 	go func() {
-		// PatchTarget 需 changing（改 URL），会 cancel + flushNow（失败）→ 返回错误并释放 adminMu。
-		_, err := e.PatchTarget(rec.ID, TargetPatch{URL: ptrStr(srv.URL)})
+		// 改到不同 URL（非禁用）：需 changing → cancel + flushNow（失败）→ 返回错误并释放 adminMu。
+		_, err := e.PatchTarget(rec.ID, TargetPatch{URL: ptrStr(s2.URL)})
 		crudDone <- err
 	}()
-	// 并发调用 Stop：不得被 CRUD 的 adminMu 永久卡死（F3/M6）。
+	// 确认 CRUD 已卡在失败的 flush（persistFn 至少触发一次）后，再并发 Stop。
+	select {
+	case <-flushStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("CRUD 未进入失败 flush")
+	}
+	// 并发调用 Stop：不得被 CRUD 的 adminMu 永久卡死（F3/R-测试）。
 	stopDone := make(chan error, 1)
 	go func() { stopDone <- e.Stop() }()
 	select {
@@ -1314,9 +1383,15 @@ func TestStopConcurrentWithCrudFlushFailure(t *testing.T) {
 		t.Fatalf("并发 Stop 被 CRUD 卡死（F3 未解）")
 	}
 	select {
-	case <-crudDone:
+	case err := <-crudDone:
+		if err == nil {
+			t.Fatalf("失败 flush 下 CRUD 应返回错误")
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("CRUD 应返回（flush 失败）")
+	}
+	if fail.Load() < 1 {
+		t.Fatalf("应确实触发失败 flush")
 	}
 }
 
@@ -1324,9 +1399,15 @@ func TestStopConcurrentWithCrudFlushFailure(t *testing.T) {
 // M6：断言目标累计 / 全局 / 小时桶同版本一致，且重试批 Seq/内容相同。
 func TestConcurrentFlushOrdered(t *testing.T) {
 	e, store := newTestEngine(t, nil, true)
-	tgt := &target{id: 71, total: new(atomic.Int64)}
+	// 用真实 DB 目标（store.CreateTarget 生成行），使 flush 的 total_bytes 落到 DB，便于断言 DB 累计。
+	rec, err := store.CreateTarget(TargetPatch{Name: ptrStr("cf"), URL: ptrStr("http://cf.example/x"), Weight: ptrInt(10), Enabled: ptrBool(true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt := &target{id: rec.ID, total: new(atomic.Int64)}
 	e.stateMu.Lock()
-	e.targets[71] = tgt
+	e.targets[rec.ID] = tgt
+	tgt.cooldownUntilMS = e.clock.Now().Add(24 * time.Hour).UnixMilli() // 避开下载/探活
 	e.stateMu.Unlock()
 
 	const n = 20
@@ -1348,16 +1429,12 @@ func TestConcurrentFlushOrdered(t *testing.T) {
 	}
 	expected := int64(n * (n + 1) / 2)
 	day := e.currentDay
-	if got := state.TargetDays[day][71]; got != expected {
+	if got := state.TargetDays[day][rec.ID]; got != expected {
 		t.Fatalf("并发刷盘后日桶 = %d, want %d（F2 建批/Seq 有序）", got, expected)
 	}
-	// M6：目标累计、全局、小时桶同版本一致（都等于 expected）。
+	// 目标金额、全局、小时桶同版本一致。
 	if got := tgt.total.Load(); got != expected {
 		t.Fatalf("内存 total = %d, want %d", got, expected)
-	}
-	// M5：目标累计与日桶同版本（在同一 countMu 线性化下读总与日/全局/小时桶）。
-	if got := tgt.total.Load(); got != expected {
-		t.Fatalf("目标累计 total = %d, want %d（M5 同版本）", got, expected)
 	}
 	if got := state.GlobalDays[day]; got != expected {
 		t.Fatalf("持久化 GlobalDays = %d, want %d", got, expected)
@@ -1366,25 +1443,49 @@ func TestConcurrentFlushOrdered(t *testing.T) {
 	if got := state.HourBuckets[hk]; got != expected {
 		t.Fatalf("持久化 HourBuckets = %d, want %d（与日桶同版本）", got, expected)
 	}
+	// DB 目标累计断言（R-测试：非内存两次）。loadHour 由 LoadEngineState 的 Targets 中该行 total_bytes 提供。
+	found := false
+	for _, r := range state.Targets {
+		if r.ID == rec.ID {
+			found = true
+			if r.TotalBytes != expected {
+				t.Fatalf("DB 目标 total_bytes = %d, want %d（R5 同版本批次）", r.TotalBytes, expected)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("DB 中未找到目标 %d", rec.ID)
+	}
 }
 
 // F2/M6：重试同批 —— persist 首败后同 Seq/内容重试，最终落库正确。
 func TestFlushRetrySameBatch(t *testing.T) {
 	e, store := newTestEngine(t, nil, true)
-	tgt := &target{id: 72, total: new(atomic.Int64)}
+	rec, err := store.CreateTarget(TargetPatch{Name: ptrStr("rs"), URL: ptrStr("http://rs.example/x"), Weight: ptrInt(10), Enabled: ptrBool(true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt := &target{id: rec.ID, total: new(atomic.Int64)}
 	e.stateMu.Lock()
-	e.targets[72] = tgt
+	e.targets[rec.ID] = tgt
 	e.stateMu.Unlock()
 
 	var calls atomic.Int64
-	var seenSeq uint64
-	var firstBatch CounterBatch
+	var first CopyBatch
+	var seqFirst uint64
 	e.persistFn = func(b CounterBatch) error {
 		if calls.Add(1) == 1 {
-			firstBatch = b // 记录首次内容
+			first = copyBatch(b) // 深拷贝首次内容
+			seqFirst = b.Seq
 			return fmt.Errorf("injected transient failure")
 		}
-		seenSeq = b.Seq
+		// 重试批需与首次逐字段 DeepEqual（R-测试：非仅 Seq）。
+		if !reflect.DeepEqual(CounterBatch(first), b) {
+			t.Fatalf("重试批内容与首次不同: first=%+v retry=%+v", CounterBatch(first), b)
+		}
+		if b.Seq != seqFirst {
+			t.Fatalf("重试批 Seq 变化: %d != %d", b.Seq, seqFirst)
+		}
 		return store.PersistBatch(b)
 	}
 	e.countBytes(tgt, 999)
@@ -1394,17 +1495,54 @@ func TestFlushRetrySameBatch(t *testing.T) {
 	if calls.Load() < 2 {
 		t.Fatalf("应重试同批: calls=%d", calls.Load())
 	}
-	if firstBatch.Seq != seenSeq {
-		// 重试批与首次相同 Seq（同批），内容相同。
-		t.Fatalf("重试批 Seq 变化: %d != %d", firstBatch.Seq, seenSeq)
-	}
 	e.countMu.Lock()
 	day := e.currentDay
 	e.countMu.Unlock()
 	state, _ := store.LoadEngineState(e.clock.Now())
-	if got := state.TargetDays[day][72]; got != 999 {
+	if got := state.TargetDays[day][rec.ID]; got != 999 {
 		t.Fatalf("重试同批后落库 = %d, want 999", got)
 	}
+}
+
+// CopyBatch 是 CounterBatch 的深拷贝视图（用于比较重试批内容不变）。
+type CopyBatch struct {
+	TargetDays   map[string]map[int64]int64
+	GlobalDays   map[string]int64
+	TargetTotals map[int64]int64
+	HourBuckets  map[int64]int64
+	TargetHealth map[int64]TargetHealthPersist
+	Seq          uint64
+}
+
+func copyBatch(b CounterBatch) CopyBatch {
+	cp := CopyBatch{
+		TargetDays:   make(map[string]map[int64]int64, len(b.TargetDays)),
+		GlobalDays:   make(map[string]int64, len(b.GlobalDays)),
+		TargetTotals: make(map[int64]int64, len(b.TargetTotals)),
+		HourBuckets:  make(map[int64]int64, len(b.HourBuckets)),
+		TargetHealth: make(map[int64]TargetHealthPersist, len(b.TargetHealth)),
+		Seq:          b.Seq,
+	}
+	for d, m := range b.TargetDays {
+		dm := make(map[int64]int64, len(m))
+		for id, v := range m {
+			dm[id] = v
+		}
+		cp.TargetDays[d] = dm
+	}
+	for k, v := range b.GlobalDays {
+		cp.GlobalDays[k] = v
+	}
+	for k, v := range b.TargetTotals {
+		cp.TargetTotals[k] = v
+	}
+	for k, v := range b.HourBuckets {
+		cp.HourBuckets[k] = v
+	}
+	for k, v := range b.TargetHealth {
+		cp.TargetHealth[k] = v
+	}
+	return cp
 }
 
 // F14：并发 ApplyConfigUpdate 控制事务不卡死，最终配置一致。
@@ -1535,5 +1673,182 @@ func TestCRUDURLConflictPreservesCooldown(t *testing.T) {
 	}
 	if healthAfter != healthRateLimited {
 		t.Fatalf("重启后 health=%q, want RateLimited", healthAfter)
+	}
+}
+
+// R3：quota token 场景（version/booked 结算闭环）。
+func TestQuotaR3Scenarios(t *testing.T) {
+	// 场景1：无限旧 token→有限新 token→旧 token 退还不得退掉新预留。
+	e, _ := newTestEngine(t, nil, true)
+	tgt := &target{id: 90, total: new(atomic.Int64)}
+	e.stateMu.Lock()
+	e.targets[90] = tgt
+	e.stateMu.Unlock()
+	e.SetDailyLimit(0) // 无限
+	tokU := e.quotaReserve(1024)
+	if tokU.amount != 1024 || tokU.booked {
+		t.Fatalf("无限 token 应 amount=1024 booked=false, got %d/%v", tokU.amount, tokU.booked)
+	}
+	e.SetDailyLimit(0.000005) // 有限 5000
+	tokF := e.quotaReserve(2000)
+	if tokF.amount != 2000 || !tokF.booked {
+		t.Fatalf("有限 token 应 amount=2000 booked=true, got %d/%v", tokF.amount, tokF.booked)
+	}
+	e.countMu.Lock()
+	resAfterF := e.reserved[e.currentDay]
+	e.countMu.Unlock()
+	e.settleRead(tokU, tgt, 1024) // 无限 token 结算不得释放他人预留
+	e.countMu.Lock()
+	resAfterU := e.reserved[e.currentDay]
+	e.countMu.Unlock()
+	if resAfterF != 2000 || resAfterU != 2000 {
+		t.Fatalf("无限 token 结算不得退掉有限预留: F=%d U=%d want 2000", resAfterF, resAfterU)
+	}
+	e.settleRead(tokF, tgt, 2000) // 清理有限预留
+
+	// 场景3：finite↔0 切换——改限额不重置实际消费；切换回有限后仍按 globalDays 计。
+	e.SetDailyLimit(0.000005) // 5000
+	tok1 := e.quotaReserve(2500)
+	e.settleRead(tok1, tgt, 2500) // globalDays=2500
+	actualBefore := tgt.total.Load()
+	e.SetDailyLimit(0) // 切无限
+	tokInf := e.quotaReserve(1000)
+	if tokInf.amount != 1000 || tokInf.booked {
+		t.Fatalf("切无限后 token 应 booked=false, got %d/%v", tokInf.amount, tokInf.booked)
+	}
+	e.settleRead(tokInf, tgt, 1000) // globalDays=3500；不重置实际消费
+	actualAfter := tgt.total.Load()
+	if actualAfter != actualBefore+1000 {
+		t.Fatalf("改限额不应重置实际消费: before=%d after=%d", actualBefore, actualAfter)
+	}
+	if tgt.total.Load() < 3000 {
+		t.Fatalf("实际消费应累计: %d", tgt.total.Load())
+	}
+
+	// 场景4：足额预留 + body 延迟 >1s 仍完成读取（预算足额不取消持有者）。
+	e2, _ := newTestEngine(t, nil, true)
+	tgt2 := &target{id: 91, total: new(atomic.Int64)}
+	e2.stateMu.Lock()
+	e2.targets[91] = tgt2
+	e2.stateMu.Unlock()
+	e2.SetDailyLimit(0.00001) // 10000，足额
+	body := &slowOnce{delay: 1100 * time.Millisecond, data: []byte("0123456789abcdef")}
+	start := time.Now()
+	if err := e2.readLoop(context.Background(), tgt2, 1, body, io.Discard); err != nil {
+		t.Fatalf("足额预留慢读取应完成: %v", err)
+	}
+	if d := time.Since(start); d < 1000*time.Millisecond {
+		t.Fatalf("慢 body 应实际延迟: %v", d)
+	}
+	if e2.blockedFlag.Load() != 0 {
+		t.Fatalf("足额预留不应取消持有者: blockedFlag=%d", e2.blockedFlag.Load())
+	}
+}
+
+// slowOnce 延迟后一次性返回 data，再返回 EOF（模拟慢 body）。
+type slowOnce struct {
+	delay time.Duration
+	data  []byte
+	done  bool
+}
+
+func (s *slowOnce) Read(p []byte) (int, error) {
+	if s.done {
+		return 0, io.EOF
+	}
+	if !s.done {
+		time.Sleep(s.delay)
+		s.done = true
+	}
+	n := copy(p, s.data)
+	return n, nil
+}
+
+// R3 场景2：跨午夜双版本读竞争——旧日预留结算入新日，新日 reader 互不干扰。
+func TestQuotaR3CrossMidnight(t *testing.T) {
+	clk := &fakeClock{now: time.Date(2024, 1, 1, 23, 50, 0, 0, time.Local)}
+	e, _ := newTestEngine(t, clk, true)
+	tgt := &target{id: 92, total: new(atomic.Int64)}
+	e.stateMu.Lock()
+	e.targets[92] = tgt
+	e.stateMu.Unlock()
+	e.SetDailyLimit(0.00001) // 10000
+
+	dayOld := dayKey(clk.Now())
+	tokOld := e.quotaReserve(3000) // 旧日预留
+	if tokOld.amount != 3000 || !tokOld.booked {
+		t.Fatalf("旧日预留应 booked 3000, got %d/%v", tokOld.amount, tokOld.booked)
+	}
+	// 跨午夜，零读取。
+	clk.advance(15 * time.Minute) // 到达 00:05 次日
+	e.recomputeGate()
+	dayNew := dayKey(clk.Now())
+	if dayNew == dayOld {
+		t.Fatalf("应跨日")
+	}
+	// 新日 reader 可正常预留（旧日 reserved 不影响新日）。
+	tokNew := e.quotaReserve(2000)
+	if tokNew.amount != 2000 {
+		t.Fatalf("新日应可预留 2000, got %d", tokNew.amount)
+	}
+	// 结算旧日 token：释放旧日 reserved（不影响新日账本）。
+	e.settleRead(tokOld, tgt, 3000)
+	e.countMu.Lock()
+	newReserved := e.reserved[dayNew]
+	oldReserved := e.reserved[dayOld]
+	e.countMu.Unlock()
+	if newReserved != 2000 {
+		t.Fatalf("新日 reserved 应 2000, got %d（旧日结算不得影响新日）", newReserved)
+	}
+	if oldReserved != 0 {
+		t.Fatalf("旧日 reserved 结算后应 0, got %d", oldReserved)
+	}
+	// 新日 token 正常结算入新日。
+	e.settleRead(tokNew, tgt, 2000)
+	e.countMu.Lock()
+	gdNew := int64(0)
+	if g := e.globalDays[dayNew]; g != nil {
+		gdNew = g.Load()
+	}
+	e.countMu.Unlock()
+	if gdNew != 5000 {
+		t.Fatalf("跨日完成读按新日结算: 旧日3000+新日2000=5000, got %d", gdNew)
+	}
+}
+
+// R1：重定向释放 host 后不得重复释放他人持有的同 host 许可（owner 化，releaseHeldHost 清空）。
+func TestR1RedirectHostOwnership(t *testing.T) {
+	tb := &trackerBox{}
+	tb.newPhase()
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(make([]byte, 64*1024))
+	}))
+	t.Cleanup(final.Close)
+	hop := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "bytes=0-1023" { // 探活放行
+			w.Write(make([]byte, 1024))
+			return
+		}
+		trk := tb.current()
+		cur := trk.inFlight.Add(1)
+		trk.updateMax(cur)
+		defer trk.inFlight.Add(-1)
+		http.Redirect(w, r, final.URL, http.StatusFound)
+	}))
+	t.Cleanup(hop.Close)
+
+	e, _ := newTestEngineWithClient(t, &http.Client{Transport: dialLoopbackTransport()}, nil, true)
+	// 三目标共享 hop host（host-hop 不同 path）重定向到同一 final，制造 host-hop 反复获取/释放。
+	id1 := createAndHealth(t, e, "x", fakeHostURL("host-hop", hop.URL)+"/a")
+	id2 := createAndHealth(t, e, "y", fakeHostURL("host-hop", hop.URL)+"/b")
+	id3 := createAndHealth(t, e, "z", fakeHostURL("host-hop", hop.URL)+"/c")
+	waitCondition(t, func() bool {
+		return totalBytes(e, id1) > 0 && totalBytes(e, id2) > 0 && totalBytes(e, id3) > 0
+	}, "三目标均产生流量")
+	// fresh tracker 观察 hop host 并发：R1 若重复释放，会被他人抢占造成并发 >1。
+	tb.newPhase()
+	time.Sleep(500 * time.Millisecond)
+	if got := tb.current().maxSeen.Load(); got > 1 {
+		t.Fatalf("重定向释放后 hop host 并发超过 1（R1 重复释放）: %d", got)
 	}
 }

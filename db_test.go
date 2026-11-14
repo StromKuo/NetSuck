@@ -310,6 +310,57 @@ func TestTargetCRUDAndErrors(t *testing.T) {
 	}
 }
 
+// R2：PatchTargetAtomic 在单个事务内改 URL 并原子重置健康（Unknown/cooldown=0/errors=0）。
+func TestPatchTargetAtomicResetsHealth(t *testing.T) {
+	store := newTestStore(t)
+	created := mustCreateTarget(t, store, "A", "https://example.com/a.bin", 7, true)
+
+	// 写入非默认健康（RateLimited + 冷却 + 错误计数）。
+	err := store.PersistBatch(CounterBatch{
+		TargetHealth: map[int64]TargetHealthPersist{
+			created.ID: {Health: "RateLimited", CooldownUntilMS: 123456, LastStatusCode: 429, LatencyMS: 88, ErrorMsg: "limited", ConsecutiveErrors: 2},
+		},
+		Seq: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed health: %v", err)
+	}
+	// url 变更且 resetHealth=true → URL 与健康原子重置。
+	rec, err := store.PatchTargetAtomic(created.ID, TargetPatch{URL: strPtr("https://example.com/a2.bin")}, true)
+	if err != nil {
+		t.Fatalf("PatchTargetAtomic: %v", err)
+	}
+	if rec.URL != "https://example.com/a2.bin" {
+		t.Fatalf("url 应更新: %q", rec.URL)
+	}
+	if rec.Health != "Unknown" || rec.CooldownUntilMS != 0 || rec.ConsecutiveErrors != 0 || rec.ErrorMsg != "" {
+		t.Fatalf("改 URL 后健康未原子重置: %+v", rec)
+	}
+	// 未重置模式：仅改 URL/名称，保留现有健康（等价原 PatchTarget）。
+	err = store.PersistBatch(CounterBatch{
+		TargetHealth: map[int64]TargetHealthPersist{
+			created.ID: {Health: "Dead", CooldownUntilMS: 0, LastStatusCode: 404, LatencyMS: 5, ErrorMsg: "gone", ConsecutiveErrors: 0},
+		},
+		Seq: 2,
+	})
+	if err != nil {
+		t.Fatalf("seed health 2: %v", err)
+	}
+	rec2, err := store.PatchTargetAtomic(created.ID, TargetPatch{Name: strPtr("A2")}, false)
+	if err != nil {
+		t.Fatalf("PatchTargetAtomic(non-reset): %v", err)
+	}
+	if rec2.Health != "Dead" || rec2.ErrorMsg != "gone" {
+		t.Fatalf("非重置模式不应清健康: %+v", rec2)
+	}
+	// 重复 url（未软删）→ ErrDuplicateURL。
+	other := mustCreateTarget(t, store, "B", "https://example.com/a3.bin", 10, true)
+	if _, err := store.PatchTargetAtomic(created.ID, TargetPatch{URL: strPtr(other.URL)}, true); !errors.Is(err, ErrDuplicateURL) {
+		t.Fatalf("atomic 到重复 url err = %v, want ErrDuplicateURL", err)
+	}
+}
+
+
 func TestPartialUniqueIndexAllowsReAddAfterSoftDelete(t *testing.T) {
 	store := newTestStore(t)
 	const url = "https://example.com/same.bin"

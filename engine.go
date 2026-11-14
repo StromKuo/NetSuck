@@ -26,6 +26,7 @@ const (
 	probeTimeout    = 10 * time.Second // 单次探活超时（规则 12）
 	probeRange      = 1024             // 探活最多读取字节数（规则 12）
 	probeInterval   = 15 * time.Minute // 定时探活间隔（规则 12）
+	probeRoundBudget = 30 * time.Second // R4：探活总轮次预算（本地等待+逐跳），超限归本地 Skipped
 	flushInterval   = 10 * time.Second // 刷盘周期（规则 10）
 	sampleInterval  = 500 * time.Millisecond
 	gateInterval    = time.Second
@@ -124,8 +125,10 @@ type flushReq struct {
 	done chan error
 }
 
-// Engine 是下载引擎核心。锁序：adminMu > stateMu > countMu > dirtyMu（dirtyMu 为叶），
-// targetLockMu / hostMu / reqMu / probeMu 为独立叶锁总在临界区内单独获取不叠于主序上（F15）。
+// Engine 是下载引擎核心。锁序（F15 实际声明）：adminMu > stateMu > countMu > dirtyMu（dirtyMu 为叶）。
+// countMu 临界区内可再取 dirtyMu（countMu→dirtyMu，声明序内）。配额/门禁在 countMu 内不再取 stateMu：
+// paused/时段/stopped 先由 recomputeGate 在 stateMu 上折合成 nonQuotaBlock 原子，countMu 内只读该原子
+// 与配额字段，故无 countMu→stateMu 反向嵌套。targetLockMu/hostMu/reqMu/probeMu 为独立叶锁单独获取。
 type Engine struct {
 	cfg        *Config
 	store      *Store
@@ -150,8 +153,9 @@ type Engine struct {
 	reqCtx    context.Context // 门禁运行期请求上下文（F6）：转阻塞时取消以中止在途 Do/WaitN/Read
 	reqCancel context.CancelFunc
 
-	stopped     atomic.Bool
-	blockedFlag atomic.Int32 // 1=被暂停/配额/时段阻塞，0=可运行（规则 6）
+	stopped      atomic.Bool
+	blockedFlag  atomic.Int32 // 1=被暂停/配额/时段阻塞，0=可运行（规则 6）
+	nonQuotaBlock atomic.Bool // F15：暂停/时段/停止 的聚合门禁（供 countMu 内不取 stateMu 直接读）
 
 	targets       map[int64]*target // stateMu
 	targetLockMu  sync.Mutex        // target 许可表（B1）
@@ -653,6 +657,17 @@ func (e *Engine) releaseHost(host string) {
 	e.notify.signal() // F1：host 释放唤醒忙目标等待者
 }
 
+// releaseHeldHost 把持有的 host 许可转存并置空后释放（R1：一次性/owner，杜绝重复释放）。
+// 成功返回路径不移除 heldHost（由调用方在 body 关闭后释放所有权）。
+func (e *Engine) releaseHeldHost(held *string) {
+	if *held == "" {
+		return
+	}
+	h := *held
+	*held = ""
+	e.releaseHost(h)
+}
+
 // tryAcquireTarget 独占目标整条请求链（B1）：含重定向换 host 期间与 body 读取直至关闭。
 func (e *Engine) tryAcquireTarget(id int64) bool {
 	e.targetLockMu.Lock()
@@ -776,6 +791,8 @@ func (e *Engine) recomputeGate() {
 	stopped := e.stopped.Load()
 	inS := inSchedule(now, e.schedule)
 	e.stateMu.RUnlock()
+	// F15：stateMu 上计算非配额门禁（暂停/时段/停止），落入原子供 countMu 内不嵌套读取。
+	e.nonQuotaBlock.Store(stopped || paused || !inS)
 
 	e.countMu.Lock()
 	e.ensureDay(dayKey(now), now) // F5：主动跨日切换（午夜即使零读取也解除配额）
@@ -784,13 +801,12 @@ func (e *Engine) recomputeGate() {
 	if limit > 0 {
 		used := int64(0)
 		if g := e.globalDays[e.currentDay]; g != nil {
-			used += g.Load()
+			used = g.Load()
 		}
-		used += e.reserved[e.currentDay]
-		quotaReached = used >= limit
+		quotaReached = used >= limit // R3：仅实际消费达上限取消在途；预算暂满不取消持有者
 	}
 	e.countMu.Unlock()
-	blocked := stopped || paused || !inS || quotaReached
+	blocked := e.nonQuotaBlock.Load() || quotaReached
 	if blocked {
 		e.blockedFlag.Store(1)
 	} else {
@@ -954,24 +970,24 @@ func (e *Engine) doRequest(ctx context.Context, t *target, gen uint64, kind requ
 	for {
 		// 发请求前重查准入（规则 1/F1）。
 		if ctx.Err() != nil {
-			e.releaseHost(heldHost)
+			e.releaseHeldHost(&heldHost)
 			return nil, "", latency, ctx.Err()
 		}
 		if e.gateBlocked() && kind == kindDownload {
-			e.releaseHost(heldHost)
+			e.releaseHeldHost(&heldHost)
 			return nil, "", latency, context.Canceled
 		}
 		if !e.eligible(t.id, gen, kind) {
-			e.releaseHost(heldHost)
+			e.releaseHeldHost(&heldHost)
 			return nil, "", latency, context.Canceled
 		}
 		if !e.tryAcquireHost(host) {
-			// 取得 host 许可前先释放已持有（规则 3）。
-			e.releaseHost(heldHost)
+			// 取得新 host 许可前先释放已持有（若有多跳残留，releaseHeldHost 幂等清理，R1）。
+			e.releaseHeldHost(&heldHost)
 			if kind == kindDownload {
 				return nil, "", latency, errHostBusy // F1：忙 host 交回 worker 可取消等待/改选
 			}
-			// 探活忙 host：可取消等待后改选；本地超时视为跳过，不改远端健康（M4）。
+			// 探活忙 host：可取消等待后改选；等待所耗只计入总轮次预算，超限归本地 Skipped（R4）。
 			if !e.notify.wait(ctx) {
 				if ctx.Err() != nil {
 					return nil, "", latency, errProbeSkipped
@@ -983,13 +999,13 @@ func (e *Engine) doRequest(ctx context.Context, t *target, gen uint64, kind requ
 		heldHost = host
 		// B1：取得 host 许可后再复查准入（消除 取许可→发请求 窗口）。
 		if !e.eligible(t.id, gen, kind) {
-			e.releaseHost(heldHost)
+			e.releaseHeldHost(&heldHost)
 			return nil, "", latency, context.Canceled
 		}
 
 		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, curURL, nil)
 		if rerr != nil {
-			e.releaseHost(heldHost)
+			e.releaseHeldHost(&heldHost)
 			return nil, "", latency, rerr
 		}
 		req.Header.Set("User-Agent", e.userAgentOf())
@@ -997,18 +1013,27 @@ func (e *Engine) doRequest(ctx context.Context, t *target, gen uint64, kind requ
 			req.Header.Set("Range", rangeSpec)
 		}
 
-		start := e.clock.Now() // M4：网络超时从实际发请求起算
-		resp, derr := e.httpClient.Do(req)
+		// R4：网络计时从实际发请求起算；探活逐跳用独立的 10s 网络超时（不把本地等待耗进网络时限）。
+		sendCtx := ctx
+		var scancel context.CancelFunc
+		if kind == kindProbe {
+			sendCtx, scancel = context.WithTimeout(ctx, probeTimeout)
+		}
+		start := e.clock.Now()
+		resp, derr := e.httpClient.Do(req.WithContext(sendCtx))
+		if scancel != nil {
+			scancel()
+		}
 		latency = int(e.clock.Now().Sub(start).Milliseconds())
 		if derr != nil {
-			e.releaseHost(heldHost)
+			e.releaseHeldHost(&heldHost)
 			return nil, "", latency, derr
 		}
 
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 && resp.StatusCode != 304 {
 			loc := resp.Header.Get("Location")
 			_ = resp.Body.Close()
-			e.releaseHost(heldHost) // 释放旧 host 许可（规则 3）
+			e.releaseHeldHost(&heldHost) // 释放旧 host 许可（规则 3），幂等清空（R1）
 			if loc == "" {
 				return nil, "", latency, fmt.Errorf("redirect without location (status %d)", resp.StatusCode)
 			}
@@ -1025,7 +1050,7 @@ func (e *Engine) doRequest(ctx context.Context, t *target, gen uint64, kind requ
 			}
 			continue
 		}
-		// 非重定向：返回响应；host 许可保持持有，由调用方在 body 关闭后释放（规则 3）。
+		// 非重定向：返回响应；heldHost 许可所有权转移给调用方在 body 关闭后释放（规则 3，R1 owner 化）。
 		return resp, heldHost, latency, nil
 	}
 }
@@ -1286,6 +1311,7 @@ type quotaToken struct {
 	amount  int64
 	day     string
 	version uint64
+	booked  bool // R3：true=有限预算中的真实预留（结算时释放其 reserved）；无限令牌为 false，不得触碰他人预留
 }
 
 // currentDayReserved 返回当前日在途预留（在 countMu 内调用）。
@@ -1303,25 +1329,29 @@ func (e *Engine) quotaReserve(n int64) quotaToken {
 	e.ensureDay(day, now) // 跨日重绑预算（F5）
 	limit := e.dailyLimit.Load()
 	if limit <= 0 {
-		return quotaToken{amount: n, day: day, version: e.qVersion} // 不限
+		return quotaToken{amount: n, day: day, version: e.qVersion} // 不限：不预留、结算不退他人预留（R3）
 	}
 	used := int64(0)
 	if g := e.globalDays[day]; g != nil {
-		used += g.Load() // 实际消费
+		used = g.Load() // 实际消费（全局唯一权威）
 	}
-	used += e.reserved[day]
-	avail := limit - used
-	if avail <= 0 {
-		e.blockedFlag.Store(1) // 配额触达：立即翻转门禁
+	reservedNow := e.reserved[day]
+	// R3：仅当实际消费已达上限才取消全局在途（门禁+reqCtx）；"预算暂满"（被在途预留占满）仅阻止新预留。
+	if used >= limit {
+		e.blockedFlag.Store(1)
 		e.notify.signal()
 		return quotaToken{day: day, version: e.qVersion}
+	}
+	avail := limit - used - reservedNow
+	if avail <= 0 {
+		return quotaToken{day: day, version: e.qVersion} // 预算暂满：新预留 0，但不取消合法持有者
 	}
 	take := n
 	if take > avail {
 		take = avail
 	}
-	e.reserved[day] += take
-	return quotaToken{amount: take, day: day, version: e.qVersion}
+	e.reserved[day] = reservedNow + take
+	return quotaToken{amount: take, day: day, version: e.qVersion, booked: true}
 }
 
 // bucketBytes 在 countMu 内把 n 字节归属到当前日/小时桶（M1 结算的一部分，不重取锁）。
@@ -1366,14 +1396,16 @@ func (e *Engine) settleRead(tok quotaToken, t *target, rn int64) {
 	now := e.clock.Now().In(time.Local)
 	completionDay := dayKey(now)
 	e.ensureDay(completionDay, now)
-	// 释放该令牌的全部预留（回对应预留日；跨日/限速变更后按钳制清账）。
-	// 已读 rn 入 globalDays=实际消费，未读 (tok.amount-rn) 释放后自然回到可用预算（M1 账本闭环）。
-	cur := e.reserved[tok.day]
-	rel := tok.amount
-	if rel > cur {
-		rel = cur
+	// R3：仅真实预留（booked）释放对应预留日的 reserved；无限令牌不预留、也不得退他人预留。
+	if tok.booked {
+		cur := e.reserved[tok.day]
+		rel := tok.amount
+		if rel > cur {
+			rel = cur
+		}
+		e.reserved[tok.day] = cur - rel
 	}
-	e.reserved[tok.day] = cur - rel
+	// 已读 rn 入 globalDays=实际消费（始终按完成日结算），未读部分随释放回到可用预算。
 	if rn > 0 {
 		e.bucketBytes(t, completionDay, now, rn)
 	}
@@ -1422,23 +1454,17 @@ func (e *Engine) ensureDay(day string, now time.Time) {
 // recomputeGateLockedQuota 在已持 countMu 时只重算配额相关的门禁（避免重复取锁，M1）。
 // quota 是否触达以实际消费 globalDays 与 in-flight 预留之和判定。
 func (e *Engine) recomputeGateLockedQuota() {
-	e.stateMu.RLock()
-	paused := e.paused
-	stopped := e.stopped.Load()
-	now := e.clock.Now()
-	inS := inSchedule(now, e.schedule)
-	e.stateMu.RUnlock()
+	// 在已持 countMu 下调用：只读 nonQuotaBlock 原子与配额字段，不取 stateMu（F15 消除嵌套）。
 	limit := e.dailyLimit.Load()
 	quotaReached := false
 	if limit > 0 {
 		used := int64(0)
 		if g := e.globalDays[e.currentDay]; g != nil {
-			used += g.Load()
+			used = g.Load()
 		}
-		used += e.reserved[e.currentDay]
-		quotaReached = used >= limit
+		quotaReached = used >= limit // R3：仅实际消费达上限
 	}
-	blocked := stopped || paused || !inS || quotaReached
+	blocked := e.nonQuotaBlock.Load() || quotaReached
 	if blocked {
 		e.blockedFlag.Store(1)
 	} else {
@@ -1551,13 +1577,28 @@ func isPermanentPersistErr(err error) bool {
 	return errors.Is(err, errStaleSeq)
 }
 
-// buildBatch 由唯一持久化协程串行调用：快照脏条目（不清理）→ countMu 下读绝对值并分配 Seq
-// → stateMu 下读健康。返回批次与脏快照（供成功后才清除）。
+// buildBatch 由唯一持久化协程串行调用。R5：先在 stateMu 抓全部目标指针与健康，再在 countMu
+// 临界区内连同 dirtyMu 快照脏集合与读取全部计数值（target total + 日/全局/小时桶），使脏集合
+// 选择与数值处于同一一致性版本；锁序为 stateMu → countMu→dirtyMu（非反向嵌套）。
 func (e *Engine) buildBatch() (*CounterBatch, *dirtySnap) {
-	snap := e.snapshotDirty()
-	if len(snap.days) == 0 && len(snap.glob) == 0 && len(snap.hours) == 0 && len(snap.targets) == 0 {
-		return nil, snap
+	// 1) stateMu：抓全部目标指针与健康（指针后续在 countMu 下读 atomic total 安全）。
+	e.stateMu.RLock()
+	type ptrHealth struct {
+		t *target
+		h TargetHealthPersist
 	}
+	all := make(map[int64]ptrHealth, len(e.targets))
+	for id, t := range e.targets {
+		all[id] = ptrHealth{t: t, h: TargetHealthPersist{
+			Health:            t.health,
+			CooldownUntilMS:   t.cooldownUntilMS,
+			LastStatusCode:    t.lastStatusCode,
+			LatencyMS:         t.latencyMS,
+			ErrorMsg:          t.errorMsg,
+			ConsecutiveErrors: t.consecutiveErrors,
+		}}
+	}
+	e.stateMu.RUnlock()
 
 	batch := &CounterBatch{
 		TargetDays:   make(map[string]map[int64]int64),
@@ -1567,33 +1608,20 @@ func (e *Engine) buildBatch() (*CounterBatch, *dirtySnap) {
 		TargetHealth: make(map[int64]TargetHealthPersist),
 	}
 
-	// M5：先 stateMu 读健康快照与目标指针，再 countMu 统一读全部计数绝对值（target total 与
-	// 日/全局/小时桶在同一线性化版本），锁序与文件头声明一致（stateMu → countMu 顺序，非嵌套）。
-	e.stateMu.RLock()
-	targetPtrs := make(map[int64]*target, len(snap.targets))
-	for id := range snap.targets {
-		t := e.targets[id]
-		if t == nil {
-			continue
-		}
-		targetPtrs[id] = t
-		batch.TargetHealth[id] = TargetHealthPersist{
-			Health:            t.health,
-			CooldownUntilMS:   t.cooldownUntilMS,
-			LastStatusCode:    t.lastStatusCode,
-			LatencyMS:         t.latencyMS,
-			ErrorMsg:          t.errorMsg,
-			ConsecutiveErrors: t.consecutiveErrors,
-		}
-	}
-	e.stateMu.RUnlock()
-
-	// countMu 下读全部计数绝对值 + TargetTotals + 分配 Seq（仅持久化协程调用，Seq 串行单调 F2）。
+	// 2) countMu 临界区：快照脏集合（dirtyMu 为叶，countMu→dirtyMu 声明序）+ 读全部计数绝对值（同版本）。
 	e.countMu.Lock()
+	snap := e.snapshotDirty() // 在 countMu 内取 dirtyMu
+	if len(snap.days) == 0 && len(snap.glob) == 0 && len(snap.hours) == 0 && len(snap.targets) == 0 {
+		e.countMu.Unlock()
+		return nil, snap
+	}
 	e.seq++
 	batch.Seq = e.seq
-	for id, t := range targetPtrs {
-		batch.TargetTotals[id] = t.total.Load()
+	for id := range snap.targets {
+		if ph, ok := all[id]; ok {
+			batch.TargetTotals[id] = ph.t.total.Load()
+			batch.TargetHealth[id] = ph.h
+		}
 	}
 	for day, ids := range snap.days {
 		per := make(map[int64]int64)
@@ -2007,10 +2035,14 @@ func (e *Engine) probeOne(id int64) {
 	gen := t.gen
 	e.stateMu.RUnlock()
 
-	pctx, cancel := context.WithTimeout(e.lifeCtx, probeTimeout)
-	defer cancel()
+	// R4：探活取消 ctx（引擎/CRUD 取消，非网络时限）与总轮次预算分离；
+	// 本地等待只计入总轮次预算，网络超时在 doRequest 内按实际发请求独立计时。
+	pctx, pCancel := context.WithCancel(e.lifeCtx)
+	defer pCancel()
+	roundCtx, roundCancel := context.WithTimeout(pctx, probeRoundBudget)
+	defer roundCancel()
 	e.probeMu.Lock()
-	e.probeCancel[id] = cancel
+	e.probeCancel[id] = pCancel
 	e.probeMu.Unlock()
 	defer func() {
 		e.probeMu.Lock()
@@ -2018,7 +2050,7 @@ func (e *Engine) probeOne(id int64) {
 		e.probeMu.Unlock()
 	}()
 
-	resp, heldHost, latency, err := e.doRequest(pctx, t, gen, kindProbe, "bytes=0-1023")
+	resp, heldHost, latency, err := e.doRequest(roundCtx, t, gen, kindProbe, "bytes=0-1023")
 	if heldHost != "" {
 		defer e.releaseHost(heldHost)
 	}
@@ -2038,14 +2070,18 @@ func (e *Engine) probeOne(id int64) {
 		return
 	}
 
-	// 探活字节计入统计与限速（规则 12）。
-	if err := e.probeRead(pctx, t, resp.Body); err != nil {
+	// 探活字节计入统计与限速（规则 12）；body 读取用独立 10s 网络窗口（R4：网络计时持续到 body 处理结束）。
+	readCtx, readCancel := context.WithTimeout(pctx, probeTimeout)
+	if err := e.probeRead(readCtx, t, resp.Body); err != nil {
+		readCancel()
+		readCancel()
 		if e.probeNotRemoteFault(err) {
 			return
 		}
 		e.onProbeTransportError(t, gen, err, latency)
 		return
 	}
+	readCancel()
 
 	if status == http.StatusOK || status == http.StatusPartialContent {
 		e.onProbeHealthy(t, gen, status, latency)
@@ -2221,10 +2257,9 @@ func (e *Engine) Snapshot() EngineSnapshot {
 	if g := e.globalDays[day]; g != nil {
 		used = g.Load() // 实际消费（不含在途预留），M1：不报昨日桶
 	}
-	reservedNow := e.reserved[day]
 	e.countMu.Unlock()
 	limit := e.dailyLimit.Load()
-	quotaReached := limit > 0 && (used+reservedNow) >= limit
+	quotaReached := limit > 0 && (used) >= limit // R3：Snapshot 配额状态以实际消费为准
 	if !paused && quotaReached {
 		status = statusQuotaReached
 	} else if !paused && !inSchedule(now, sched) {
@@ -2623,14 +2658,22 @@ func (e *Engine) PatchTarget(id int64, p TargetPatch) (TargetRecord, error) {
 		}
 	}
 
-	rec, err := e.store.PatchTarget(id, p)
-	if err != nil {
+	// R2：改 URL 时 URL 变更与健康重置（Unknown/cooldown=0/errors=0）在同一 DB 事务提交，
+	// 消除"提交 URL 后、健康批前非优雅中断"的崩溃窗口；非 URL 变更走原 PatchTarget。
+	var rec TargetRecord
+	var dbErr error
+	if urlChanged {
+		rec, dbErr = e.store.PatchTargetAtomic(id, p, true)
+	} else {
+		rec, dbErr = e.store.PatchTarget(id, p)
+	}
+	if dbErr != nil {
 		// DB 失败：恢复旧目标准入与元数据（F8/B2：持久化未修改，旧健康/冷却保留）。
 		if needsChanging {
 			e.restoreTarget(id, &oldSnap)
 			e.setChanging(id, false)
 		}
-		return TargetRecord{}, err
+		return TargetRecord{}, dbErr
 	}
 
 	e.stateMu.Lock()
