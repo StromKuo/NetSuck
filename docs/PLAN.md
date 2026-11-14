@@ -49,7 +49,7 @@
 ```go
 type ScheduleConfig struct {
     StartHour int `yaml:"start_hour"` // 0-23
-    EndHour   int `yaml:"end_hour"`   // 0-23，支持跨夜（如 23 → 07）
+    EndHour   int `yaml:"end_hour"`   // 0-24（24 = 当日午夜结束）；支持跨夜（如 23 → 07）
 }
 type JitterConfig struct {
     MinSeconds int `yaml:"min_seconds"` // 默认 5
@@ -77,8 +77,10 @@ type Config struct {
 }
 
 func LoadConfig(path string) (*Config, error)      // 缺文件报错；缺字段填默认值；越界/非法值报错
-func (c *Config) Save(path string) error           // 原子写：临时文件 + rename；保留 yaml 注释不强求
+func (c *Config) Save(path string) error           // 原子写：临时文件 + rename；保留 yaml 注析不强求
 ```
+
+**schedule 语义（定案）**：活跃窗口为 `[start_hour, end_hour)`；`end_hour=24` 表示到当日午夜；当 `end_hour <= start_hour` 时表示跨夜窗口（如 23→07 = 23:00 至次日 07:00）；默认 `{0, 24}` 即全天。校验：`0<=start<=23`、`0<=end<=24`。
 
 **config.example.yaml 要求**：内置 ≥12 个分散厂商的大体积公开直链（云厂商测速包、镜像站 ISO、大厂安装包等），每条含 name/中文注释；T2 实现时必须用 `curl -s -o /dev/null -w '%{http_code}' -r 0-1023 -A '<UA>' <URL>` 逐一验证返回 200/206，验证结果写进任务报告。
 
@@ -108,7 +110,7 @@ CREATE TABLE IF NOT EXISTS history (
 );
 ```
 
-- 接口：`Open(path) / InitSchema / SyncFromConfig(cfg)`（**仅播种**：按 url 不存在则插入，绝不改动/删除 DB 已有行）/ `ListTargets / AddTarget / UpdateTarget(部分字段) / DeleteTarget / FlushCounters(per-target 今日与累计绝对值 upsert + 当小时全局流量 upsert) / History24h()（补零返回 24 个点，最旧在前）/ TodayGlobalBytes()`。
+- 接口：`Open(path) / InitSchema / SyncFromConfig(cfg)`（**仅首次播种**：targets 表为空时才插入 config 的 targets；此后 DB 是 URL 列表的唯一权威，config.yaml 的 targets 变更不再回灌，避免复活用户已删除的 URL）/ `ListTargets / AddTarget / UpdateTarget(部分字段) / DeleteTarget / FlushCounters(per-target 今日与累计绝对值 upsert + 当小时全局流量 upsert) / History24h()（补零返回 24 个点，最旧在前）/ TodayGlobalBytes()`。
 - 单位约定：1 GB = 1,000,000,000 字节（十进制，协调者决策）。
 
 ## 5. 引擎契约（engine.go）
@@ -142,7 +144,10 @@ func (e *Engine) ReloadTargets()                     // CRUD 后从 DB 重载
 9. **实时速率**：采样协程每 500ms 读取各 atomic 累计值入环形缓冲，滑动 3 秒窗口计算 per-target 与全局速率（同时给出 MB/s 与 Mbps）。
 10. **HTTP 客户端**：全局单例；`Transport{MaxIdleConns:10, MaxConnsPerHost:1, IdleConnTimeout:90s}`；桌面 UA；自动跟随重定向。
 11. **存储模式**：discard → `io.CopyBuffer(io.Discard, 32KB)`；memory → 写 `memory_dir` 临时文件、完成或出错即 `os.Remove`；disk → 写 `disk_dir`（文件保留，协调者决策：供缓存需求），文件名取 URL basename + 时间戳防冲突。
-12. **退出信号**：`Stop()` 后由 main 调 `db.FlushCounters` 落盘（运行期每 10s 也刷一次）。
+12. **退出信号**：`Stop()` 由 main 在收到 SIGTERM/SIGINT 后调用；Engine 内部完成「取消 ctx → 等 worker 收尾 → **最终 FlushCounters**」整个序列（main 不另行刷盘，避免双重写）。
+13. **刷盘一致性规则**：Engine 内**单一** flush 协程每 10 秒做一次快照刷盘；任何时刻只有该协程调用 `db.FlushCounters`。计数为**绝对值 upsert**（today 按 (day,target) 键、total 按 target 键、history 按 hour 键），天然幂等，崩溃最多丢最近 10 秒。
+14. **跨日切换规则**：由配额协程在本地 00:00 触发，顺序固定：①先做一次旧日最终 flush → ②持同一把日切锁把日期标签翻到新日并清零全部内存 today 计数、解除 `quota_reached` → ③此后计数入新日。字节累加与日期标签的读取由该锁保证不会跨日记错。
+15. **冷却恢复规则**：探活（定时或手动）返回 200/206 时——若 health 为 `Dead` → 恢复 `Healthy`；若为 `RateLimited` 且 `now >= cooldown_until` → 清除冷却恢复 `Healthy`；若 `RateLimited` 且未到期 → 保持冷却，仅更新延迟与 error_msg。任何情况下探活不得提前解除未到期冷却。
 
 ## 6. API 与前端契约（main.go + web/index.html）
 
