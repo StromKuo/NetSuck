@@ -1,169 +1,145 @@
-# ============================================================================
-# NetSuck 默认配置模板
-# ----------------------------------------------------------------------------
-# NetSuck（Because asymmetrical throttling sucks.）是专为 NAS 打造的轻量级
-# HTTP/HTTPS 下行流量生成工具：以受控带宽持续下载公开大文件，平衡家庭宽带的
-# 上下行流量比例。本文件会在首次启动时被复制为 /data/config.yaml，
-# 之后可在 Web 面板中修改并自动持久化回该文件。
+# ============================================================
+# NetSuck 配置文件模板  ——  Because asymmetrical throttling sucks.
+# ============================================================
+# 首次启动时，若 -config 指定的文件不存在，程序会复制本文件为
+# /data/config.yaml（绝不覆盖已有文件）。
 #
-# 说明：标有“默认”的取值即缺省值；删除某一行时程序会回退到该默认值。
-# 显式写出的 0 / false 不会被替换为默认值（如 max_rate_mbps: 0 = 不限速）。
-# ============================================================================
+# 【重要】targets 列表只在**首次启动**（stats.db 尚无播种标记）时
+# 导入 SQLite。之后 URL 列表以数据库为唯一权威：
+#   · 在 Web 面板增删改 → 立即生效，重启不会被本文件覆盖
+#   · 想恢复本文件的默认列表 → 删除 /data/stats.db 后重启
+# 而限速 / 并发 / 配额 / 存储模式等**运行参数**，则在面板修改后
+# 自动写回 config.yaml，每次启动以本文件为准。
+# ============================================================
 
-# Web 面板监听地址（host:port），默认 ":8080"。
+# 监听地址（容器内保持 :8080，宿主机端口在 docker-compose 映射）
 listen_addr: ":8080"
 
-# 响应体处理模式，默认 "discard"：
-#   discard —— 固定 32KB 缓冲区循环读取并丢入 io.Discard，零磁盘 I/O（推荐）
-#   memory  —— 写入 memory_dir（建议挂载为 tmpfs 内存盘），完成后立即删除
-#   disk    —— 写入 disk_dir（文件保留，供有缓存需求的用户）
+# 下载数据的处理方式：
+#   discard —— 纯内存丢弃，32KB 固定缓冲，零磁盘 I/O（默认推荐）
+#   memory  —— 写入内存盘目录，完成即删除（容器需挂 tmpfs 并限制大小）
+#   disk    —— 写入持久化目录并保留文件（供有缓存需求的用户）
 storage_mode: "discard"
 
-# memory 模式的临时目录，默认 "/tmp/dl_cache"。
+# memory 模式临时目录（Docker 中应挂载为有大小上限的 tmpfs）
 memory_dir: "/tmp/dl_cache"
-
-# disk 模式的落盘目录，默认 "/data/downloads"。
+# disk 模式落盘目录
 disk_dir: "/data/downloads"
 
-# 全局下行限速（Mbps），默认 0 = 不限速。
-# 建议按宽带规格留出余量：1000M 宽带设 100 即占用 100Mbps、余 900Mbps 给日常使用。
-# 支持 Web 面板热修改，立即生效。
-max_rate_mbps: 100
+# 全局下行限速（Mbps）。0 = 不限速。
+# 建议取带宽的 10%~30%，为日常上网留足余量。
+max_rate_mbps: 150
 
-# 全局最大并发连接数，默认 2，取值范围 1-10。
-# 2-3 条大厂 CDN 连接即可跑满 100-300Mbps；过多连接会打满光猫 NAT 会话表。
-# 支持 Web 面板热修改（平滑增减 worker）。
-max_connections: 2
+# 全局最大并发下载连接数（1~10）。
+# 2~3 条大厂 CDN 连接即可跑满百兆带宽，且不会打满光猫 NAT 会话表。
+max_connections: 3
 
-# 每日流量配额（GB，十进制 1GB = 1e9 字节），默认 0 = 不限量。
-# 达到上限后自动休眠，本地时间 00:00（遵循 TZ 环境变量）自动清零。
-# 支持 Web 面板热修改。
-daily_limit_gb: 300
+# 每日流量配额上限（GB，1 GB = 1e9 字节）。0 = 不限量。
+# 达到后自动休眠，本地时间 00:00 自动清零恢复。
+daily_limit_gb: 0
 
-# 每日活跃时间段 [start_hour, end_hour)，默认 {0, 24} = 全天。
-#   start_hour: 0-23；end_hour: 0-24（24 表示到当日午夜）。
-#   start_hour < end_hour：同日窗口，如 1 → 18 表示 01:00-17:59 活跃；
-#   start_hour > end_hour：跨夜窗口，如 23 → 7 表示 23:00 至次日 06:59 活跃。
-#   start_hour 与 end_hour 不允许相等。
+# 活跃时间段（本地时区，遵循 TZ 环境变量）。
+# 窗口为 [start_hour, end_hour)；end_hour=24 表示到当日午夜；
+# end_hour <= start_hour 表示跨夜（如 23 → 7 表示 23:00 至次日 07:00）。
 schedule:
   start_hour: 0
   end_hour: 24
 
-# 单个文件下载完成后的随机休眠区间（秒），默认 {5, 30}。
-# 让带宽曲线呈现自然波动，降低固定频率请求特征。min 不得大于 max。
+# 每次下载完成后随机休眠的秒数区间，使带宽曲线自然波动。
 jitter_seconds:
   min_seconds: 5
   max_seconds: 30
 
-# 触发 403/429 限流后的冷却时长（小时），默认 6，必须大于 0。
-# 冷却期间调度器绝不请求该链接，避免公网 IP 被 CDN 拉黑。
+# 遇到 403/429 限流后的冷却小时数，期间不再请求该链接。
 cooldown_hours: 6
 
-# 请求使用的 User-Agent，默认桌面版 Chrome UA。
-# 建议保持桌面浏览器特征，部分 CDN 会拒绝非浏览器 UA（curl 默认 UA 易被 403）。
+# 请求使用的 User-Agent（桌面浏览器 UA，兼顾兼容性与防风控）。
 user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-# 下载目标列表。字段说明：
-#   name    —— 显示名称（非空，用于面板与统计区分）
-#   url     —— 公开直链，必须为 http/https，且不含账号密码（userinfo）
-#   weight  —— 调度权重，默认 10，必须 >= 1；数值越大被选中的概率越高
-#   enabled —— 是否启用，默认 true；false 表示保留配置但不参与调度
-#
-# 以下 18 条直链均于 2026-11-14 以 Range: bytes=0-1023 逐一实测返回 206，
-# 覆盖海外云厂商测速文件、发行版官方 ISO、国内云/门户镜像站与大厂安装包，
-# 优先选择大体积文件以压低请求频次（QPS）。如某条链接失效，可在面板中停用或删除。
+# ------------------------------------------------------------
+# 下载目标列表（20 条，均为大体积公开直链，已实测可下载）
+# weight 越高被调度越频繁，用于偏好大文件源以降低请求频次。
+# 优先选用国内 CDN 的应用安装包/客户端，单文件大、更新频繁、
+# 带宽充足，且对家庭宽带友好。
+# ------------------------------------------------------------
 targets:
-  # ---- 云厂商测速文件 ----
-  - name: "OVH 测速文件 100MB"
-    url: "https://proof.ovh.net/files/100Mb.dat"
-    weight: 10
+  - name: "百度手机助手 抖音APK"
+    url: "https://ms2-gdown.baidu.com/appcenter/pkg/upload/8b5eb29b473645c4a64306237cff54f3?md5hash=4bc22055c05f7f841827d4f3f56bd1e4&timestamp=1794674803"
+    weight: 15
     enabled: true
-
-  - name: "Vultr 新加坡 100MB 测速文件"
-    url: "https://sgp-ping.vultr.com/vultr.com.100MB.bin"
-    weight: 10
+  - name: "应用宝 Mac 版"
+    url: "https://downmac.yyb.qq.com/channel/formal/raw/RsHmInBRX0pQKbhe/mac_yyb_0.8.5.2299.dmg?response-content-disposition=attachment%3Bfilename%3Dmacyyb_2100200129_6db116acfd367301.dmg"
+    weight: 15
     enabled: true
-
-  # ---- 开源基础设施 ----
-  - name: "Linux 内核源码 linux-6.6.60（kernel.org）"
-    url: "https://mirrors.edge.kernel.org/pub/linux/kernel/v6.x/linux-6.6.60.tar.xz"
-    weight: 10
+  - name: "百度网盘客户端 Apple 芯片"
+    url: "https://f3efc9-2075664007.antpcdn.com:19001/b/pkg-ant.baidu.com/issue/netdisk/MACguanjia/8.10.3/BaiduNetdisk_mac_8.10.3_arm64.dmg"
+    weight: 15
     enabled: true
-
-  # ---- 发行版官方源 ----
-  - name: "Ubuntu 26.04.1 Server ISO（官方 releases）"
-    url: "https://releases.ubuntu.com/26.04.1/ubuntu-26.04.1-live-server-amd64.iso"
-    weight: 10
-    enabled: true
-
-  - name: "Debian 13.7 netinst ISO（官方 cdimage）"
-    url: "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-13.7.0-amd64-netinst.iso"
-    weight: 10
-    enabled: true
-
-  - name: "Arch Linux 最新 ISO（官方镜像）"
-    url: "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso"
-    weight: 10
-    enabled: true
-
-  - name: "Alpine Linux 3.22 标准 ISO"
-    url: "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-standard-3.22.0-x86_64.iso"
-    weight: 10
-    enabled: true
-
-  - name: "Rocky Linux 9 Minimal ISO（官方源）"
-    url: "https://download.rockylinux.org/pub/rocky/9/isos/x86_64/Rocky-9-latest-x86_64-minimal.iso"
-    weight: 10
-    enabled: true
-
-  # ---- 国内镜像站（华为云 / 网易） ----
-  - name: "Ubuntu 26.04.1 Server ISO（华为云镜像）"
-    url: "https://mirrors.huaweicloud.com/ubuntu-releases/26.04.1/ubuntu-26.04.1-live-server-amd64.iso"
-    weight: 10
-    enabled: true
-
-  - name: "Debian 13.7 netinst ISO（华为云镜像）"
-    url: "https://mirrors.huaweicloud.com/debian-cd/current/amd64/iso-cd/debian-13.7.0-amd64-netinst.iso"
-    weight: 10
-    enabled: true
-
   - name: "Ubuntu 26.04.1 Server ISO（网易镜像）"
     url: "https://mirrors.163.com/ubuntu-releases/26.04.1/ubuntu-26.04.1-live-server-amd64.iso"
     weight: 10
     enabled: true
-
-  # ---- 大厂官方发布包 ----
-  - name: "Go 1.27.4 Linux amd64（go.dev）"
-    url: "https://dl.google.com/go/go1.27.4.linux-amd64.tar.gz"
+  - name: "360 浏览器"
+    url: "https://sedl.360tpcdn.com/se/360se_setup.exe"
+    weight: 15
+    enabled: true
+  - name: "酷喵TV"
+    url: "https://gtvappstore.alicdn.com/tvapp3/apks/20260920/20260920-35448d67-8f80-428f-b872-f94f27c964ff.apk"
+    weight: 15
+    enabled: true
+  - name: "华为应用市场 Windows版"
+    url: "https://appdl-1-drcn.dbankcdn.com/dl/appdl/application/apk/43/43f559c2e00d4748b141b6d6a2d2e000/PC93a08d9df14b48ec849fb09da8042508.2610221711.exe?maple=0&trackId=0&distOpEntity=HWSW&cno=H5"
+    weight: 15
+    enabled: true
+  - name: "Ubuntu 26.04.1 Server ISO（华为云镜像）"
+    url: "https://mirrors.huaweicloud.com/ubuntu-releases/26.04.1/ubuntu-26.04.1-live-server-amd64.iso"
     weight: 10
     enabled: true
-
-  - name: "Node.js 26.13.1 LTS Linux x64（nodejs.org）"
-    url: "https://nodejs.org/dist/v26.13.1/node-v26.13.1-linux-x64.tar.xz"
+  - name: "抖音Mac客户端"
+    url: "https://www.douyin.com/download/pc/obj/douyin-pc-web/douyin-pc-client/7044145585217083655/releases/540056698/8.8.0/darwin-universal/douyin-v8.8.0-darwin-universal.dmg"
+    weight: 15
+    enabled: true
+  - name: "测速网TV4.2.0.apk"
+    url: "https://file2.speedtest.cn/clients/测速网TV4.2.0.apk"
+    weight: 15
+    enabled: true
+  - name: "爱奇艺极速版"
+    url: "https://alicoccdncmnet-hb.inter.71edge.com/cdn/qiyiapp/20261029/0a69506acce89ce004303b1590efc95c/iqiyilite_32_64.apk?dis_dz=CMNET-BeiJing&dis_st=105&qdv=3&random=1&rand_hash=0&uuid=24098a00799960d0505400fffef39a46-1a1db076b5e-2e7"
+    weight: 15
+    enabled: true
+  - name: "阿里云盘客户端 Apple 芯片"
+    url: "https://cdn.aliyundrive.net/downloads/apps/desktop/aDrive-6.9.3-arm64.dmg?spm=aliyundrive.index.0.0.7db16f609JeZBY&file=aDrive-6.9.3-arm64.dmg"
+    weight: 15
+    enabled: true
+  - name: "鲁大师"
+    url: "https://cdn-file-ssl-pc.ludashi.com/wpackage/other/neargalestore/1.2925.1130.311/PCStoreSetup_officialwebsite.exe"
+    weight: 15
+    enabled: true
+  - name: "芒果TV"
+    url: "https://download.hitv.com/app/android/9.4.8/mgtv_aphone_9408100_release_prod_v64_261113_1410_ImgoJiagu_mgtv3.apk"
+    weight: 15
+    enabled: true
+  - name: "Ubuntu 26.10 Desktop ISO（中科大镜像）"
+    url: "https://mirrors.ustc.edu.cn/ubuntu-releases/26.10/ubuntu-26.10-desktop-amd64.iso"
+    weight: 15
+    enabled: true
+  - name: "金山毒霸"
+    url: "https://cd001.www.duba.net/duba/install/packages/ever/kinsthomeui_150_15.exe"
+    weight: 15
+    enabled: true
+  - name: "腾讯视频 TV 客户端"
+    url: "https://vmat.gtimg.com/kt2/web/ktweb/protocol/202611121546545736_202611061925143013_tv_video_20.4.0.1018_android_15000.apk"
+    weight: 15
+    enabled: true
+  - name: "Debian 13.7 netinst ISO（华为云镜像）"
+    url: "https://mirrors.huaweicloud.com/debian-cd/current/amd64/iso-cd/debian-13.7.0-amd64-netinst.iso"
     weight: 10
     enabled: true
-
-  - name: "Python 3.15.2 Windows 安装包（python.org）"
-    url: "https://www.python.org/ftp/python/3.15.2/python-3.15.2-amd64.exe"
+  - name: "光鸭云盘 Mac 客户端"
+    url: "https://gyp.guangyapan.com/guangyapan_pc/guangyapan-1.1.2-arm64-mac.dmg"
     weight: 10
     enabled: true
-
-  - name: "Rust 1.91.0 工具链 x86_64-linux（rust-lang.org）"
-    url: "https://static.rust-lang.org/dist/rust-1.91.0-x86_64-unknown-linux-gnu.tar.xz"
-    weight: 10
-    enabled: true
-
-  - name: "Blender 5.0 Linux x64（blender.org）"
-    url: "https://download.blender.org/release/Blender5.0/blender-5.0.0-linux-x64.tar.xz"
-    weight: 10
-    enabled: true
-
-  - name: "Google Chrome 安装包（google.com）"
-    url: "https://dl.google.com/chrome/install/latest/chrome_installer.exe"
-    weight: 10
-    enabled: true
-
-  - name: "VS Code 最新稳定版 macOS arm64（visualstudio.com）"
-    url: "https://update.code.visualstudio.com/latest/darwin-arm64/stable"
-    weight: 10
+  - name: "微信Mac端"
+    url: "https://dldir1v6.qq.com/weixin/Universal/Mac/WeChatMac_4.2.0.dmg"
+    weight: 15
     enabled: true
