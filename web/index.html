@@ -69,7 +69,7 @@
       <!-- 品牌标识与标语 -->
       <div class="flex items-center gap-3">
         <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 to-indigo-400 flex items-center justify-center text-white shadow-md shadow-indigo-500/20">
-          <!-- 吸取/涡流/下载网络内联 SVG 图标 -->
+          <!-- 吸取/下载网络内联 SVG 图标 -->
           <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
           </svg>
@@ -149,7 +149,7 @@
         </div>
       </div>
 
-      <!-- 卡片 2：今日已刷流量与配额进度条 -->
+      <!-- 卡片 2：今日已刷流量与配额进度条（daily_limit_gb=0 显示不限量并隐藏百分比计算） -->
       <div class="bg-white dark:bg-slate-800 rounded-2xl p-5 border border-slate-200/80 dark:border-slate-700 shadow-sm relative overflow-hidden flex flex-col justify-between">
         <div>
           <div class="flex items-center justify-between">
@@ -363,7 +363,9 @@
 
         <div>
           <label class="block font-medium text-slate-700 dark:text-slate-300 mb-1">目标直链 URL (必须为 http/https)</label>
-          <input id="addUrl" type="url" required placeholder="https://mirrors.aliyun.com/.../file.iso" class="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100">
+          <input id="addUrl" type="url" required placeholder="https://mirrors.aliyun.com/.../file.iso" oninput="clearAddUrlError()" class="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100">
+          <!-- 409 URL 重复内联错误提示容器 -->
+          <p id="addUrlError" class="hidden text-red-500 dark:text-red-400 text-[11px] mt-1.5 flex items-center gap-1"></p>
         </div>
 
         <div class="grid grid-cols-2 gap-4">
@@ -448,10 +450,10 @@
         <div>
           <label class="block font-medium text-slate-700 dark:text-slate-300 mb-1">每日配额上限 (GB，输入 0 表示不限量)</label>
           <div class="relative">
-            <input id="quotaInput" type="number" step="any" min="0" required placeholder="如 300" class="w-full px-3 py-2 pr-10 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100">
+            <input id="quotaInput" type="number" step="any" min="0" required placeholder="如 300，0为不限量" class="w-full px-3 py-2 pr-10 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100">
             <span class="absolute right-3 top-2 text-slate-400 font-medium">GB</span>
           </div>
-          <p class="text-[11px] text-slate-400 mt-1">当日累计刷流达到配额后自动休眠，次日 00:00 自动清零并恢复。</p>
+          <p class="text-[11px] text-slate-400 mt-1">当日累计刷流达到配额后自动休眠，次日 00:00 自动清零并恢复；设为 0 表示不限制每日流量。</p>
         </div>
 
         <div class="pt-3 border-t border-slate-100 dark:border-slate-700 flex justify-end gap-2">
@@ -602,6 +604,21 @@
         },
         {
           id: 6,
+          name: "Alpine Linux 初始探活示例",
+          url: "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-standard-3.20.0-x86_64.iso",
+          weight: 10,
+          enabled: true,
+          health: "Unknown",
+          latency_ms: 0,
+          cooldown_remaining_seconds: 0,
+          today_bytes: 0,
+          total_bytes: 0,
+          speed_mbps: 0.0,
+          speed_mb_per_sec: 0.0,
+          error_msg: ""
+        },
+        {
+          id: 7,
           name: "微信 Windows 客户端官方直链",
           url: "https://dldir1.qq.com/weixin/Windows/WeChatSetup.exe",
           weight: 5,
@@ -625,7 +642,7 @@
       for (let i = 23; i >= 0; i--) {
         const d = new Date(now.getTime() - i * 3600 * 1000);
         d.setMinutes(0, 0, 0);
-        // 生成波动流量，白天大晚上小
+        // 生成波动流量，活跃时段高
         const hour = d.getHours();
         let baseGb = (hour >= 1 && hour <= 18) ? (1.5 + Math.random() * 2.8) : 0.1;
         list.push({
@@ -637,7 +654,7 @@
     }
 
     // ==========================================
-    // 1. 网络请求统一封装 (自动适配 Demo 模式)
+    // 1. 网络请求统一封装 (处理 JSON 404 / 4xx / 5xx)
     // ==========================================
     async function apiRequest(endpoint, options = {}) {
       if (isDemoMode) {
@@ -649,14 +666,32 @@
           headers: { 'Content-Type': 'application/json' },
           ...options
         });
+
         if (!res.ok) {
-          const errData = await res.json().catch(() => ({}));
-          throw new Error(errData.error || `HTTP ${res.status}`);
+          let errorMsg = `HTTP ${res.status}`;
+          try {
+            // 未知 /api 路径或报错，后端返回 JSON ({"error":"..."})
+            const errData = await res.json();
+            if (errData && errData.error) {
+              errorMsg = errData.error;
+            }
+          } catch (e) {
+            // 非 JSON 格式 fallback
+          }
+          const err = new Error(errorMsg);
+          err.status = res.status;
+          // HTTP 响应成功到达（即使是 400/404/405/409/500）说明服务端在线可通信
+          setOnline(true);
+          throw err;
         }
+
         setOnline(true);
         return await res.json();
       } catch (err) {
-        setOnline(false);
+        // 如果是原生网络故障（如 Failed to fetch / 连接拒绝，无 status 属性），判定服务离线
+        if (err.status === undefined) {
+          setOnline(false);
+        }
         throw err;
       }
     }
@@ -684,7 +719,7 @@
 
     // Demo 模式请求拦截处理器
     async function mockApiHandler(endpoint, options) {
-      await new Promise(r => setTimeout(r, 80)); // 仿真延迟
+      await new Promise(r => setTimeout(r, 60)); // 仿真网络延迟
       const method = (options.method || 'GET').toUpperCase();
       const body = options.body ? JSON.parse(options.body) : {};
 
@@ -709,6 +744,14 @@
 
       // 3. POST /api/targets
       if (endpoint === '/api/targets' && method === 'POST') {
+        // 409 URL 重复模拟验证
+        const reqUrl = (body.url || '').trim().toLowerCase();
+        if (mockState.targets.some(t => t.url.trim().toLowerCase() === reqUrl)) {
+          const err = new Error("target url already exists");
+          err.status = 409;
+          throw err;
+        }
+
         const newId = (mockState.targets.length ? Math.max(...mockState.targets.map(t => t.id)) : 0) + 1;
         const newTarget = {
           id: newId,
@@ -716,7 +759,7 @@
           url: body.url,
           weight: body.weight || 10,
           enabled: body.enabled !== false,
-          health: "Unknown",
+          health: "Unknown", // 初始健康状态为 Unknown
           latency_ms: 0,
           cooldown_remaining_seconds: 0,
           today_bytes: 0,
@@ -735,9 +778,23 @@
         const t = mockState.targets.find(x => x.id === id);
         if (t) {
           if (body.name !== undefined) t.name = body.name;
-          if (body.url !== undefined) t.url = body.url;
+          if (body.url !== undefined) {
+            // URL 查重
+            const reqUrl = body.url.trim().toLowerCase();
+            if (mockState.targets.some(x => x.id !== id && x.url.trim().toLowerCase() === reqUrl)) {
+              const err = new Error("target url already exists");
+              err.status = 409;
+              throw err;
+            }
+            t.url = body.url;
+            t.health = "Unknown"; // 改 URL 后状态重置为 Unknown 触发重新探活
+          }
           if (body.weight !== undefined) t.weight = body.weight;
           if (body.enabled !== undefined) t.enabled = body.enabled;
+        } else {
+          const err = new Error("target not found");
+          err.status = 404;
+          throw err;
         }
         return { ok: true };
       }
@@ -745,6 +802,12 @@
       // 5. DELETE /api/targets/{id}
       if (endpoint.startsWith('/api/targets/') && method === 'DELETE') {
         const id = parseInt(endpoint.split('/')[3], 10);
+        const exists = mockState.targets.some(x => x.id === id);
+        if (!exists) {
+          const err = new Error("target not found");
+          err.status = 404;
+          throw err;
+        }
         mockState.targets = mockState.targets.filter(x => x.id !== id);
         return { ok: true };
       }
@@ -785,11 +848,18 @@
           if (body.max_connections !== undefined) mockState.status.max_connections = body.max_connections;
           if (body.daily_limit_gb !== undefined) mockState.status.daily_limit_gb = body.daily_limit_gb;
           if (body.storage_mode !== undefined) mockState.status.storage_mode = body.storage_mode;
+        } else {
+          const err = new Error("invalid action");
+          err.status = 400;
+          throw err;
         }
         return { ok: true };
       }
 
-      return { ok: true };
+      // 未知 /api 路径仿真 JSON 404
+      const err = new Error("route not found");
+      err.status = 404;
+      throw err;
     }
 
     // ==========================================
@@ -857,7 +927,6 @@
 
       // 2. 引擎状态徽标
       const badge = document.getElementById('engineStatusBadge');
-      const badgeText = document.getElementById('engineStatusText');
       const toggleBtn = document.getElementById('toggleEngineBtn');
       const toggleLabel = document.getElementById('toggleEngineLabel');
 
@@ -885,34 +954,38 @@
       document.getElementById('activeConnCount').textContent = st.active_connections ?? 0;
       document.getElementById('maxConnDisplay').textContent = st.max_connections ?? 2;
 
-      // 4. 今日流量与每日上限
+      // 4. 今日流量与每日上限（UI 规则 1：daily_limit_gb=0 显示「不限量」，隐藏进度条百分比计算）
       const todayGb = (st.today_bytes / 1e9);
       document.getElementById('todayTrafficGB').textContent = todayGb.toFixed(2);
       document.getElementById('todayTrafficExact').textContent = formatBytes(st.today_bytes);
 
       const limitGb = st.daily_limit_gb || 0;
-      const limitText = limitGb > 0 ? `${limitGb} GB` : '无限制';
-      document.getElementById('dailyLimitText').textContent = limitText;
+      const limitTextEl = document.getElementById('dailyLimitText');
+      const quotaPercentEl = document.getElementById('quotaPercentText');
+      const progressBar = document.getElementById('quotaProgressBar');
 
-      let pct = 0;
       if (limitGb > 0) {
-        pct = Math.min(100, Math.max(0, (todayGb / limitGb) * 100));
-        document.getElementById('quotaPercentText').textContent = `${pct.toFixed(1)}%`;
-        document.getElementById('quotaProgressBar').style.width = `${pct}%`;
+        limitTextEl.textContent = `${limitGb} GB`;
+        // 计算百分比
+        const pct = Math.min(100, Math.max(0, (todayGb / limitGb) * 100));
+        quotaPercentEl.textContent = `${pct.toFixed(1)}%`;
+        progressBar.style.width = `${pct}%`;
         if (pct >= 100) {
-          document.getElementById('quotaProgressBar').className = "bg-red-500 h-2 rounded-full progress-bar-transition";
+          progressBar.className = "bg-red-500 h-2 rounded-full progress-bar-transition";
         } else if (pct >= 85) {
-          document.getElementById('quotaProgressBar').className = "bg-amber-500 h-2 rounded-full progress-bar-transition";
+          progressBar.className = "bg-amber-500 h-2 rounded-full progress-bar-transition";
         } else {
-          document.getElementById('quotaProgressBar').className = "bg-indigo-600 dark:bg-indigo-500 h-2 rounded-full progress-bar-transition";
+          progressBar.className = "bg-indigo-600 dark:bg-indigo-500 h-2 rounded-full progress-bar-transition";
         }
       } else {
-        document.getElementById('quotaPercentText').textContent = '未设限';
-        document.getElementById('quotaProgressBar').style.width = '100%';
-        document.getElementById('quotaProgressBar').className = "bg-slate-300 dark:bg-slate-600 h-2 rounded-full progress-bar-transition";
+        // daily_limit_gb=0 显式展示「不限量」，不进行百分比计算
+        limitTextEl.textContent = '不限量';
+        quotaPercentEl.textContent = '不限量';
+        progressBar.style.width = '100%';
+        progressBar.className = "bg-slate-200 dark:bg-slate-700 h-2 rounded-full progress-bar-transition";
       }
 
-      // 5. 限速输入框、最大连接、存储模式与活跃时段（避免打扰用户当前聚焦输入）
+      // 5. 限速输入框、最大连接、存储模式与活跃时段（若当前正在输入则不打断）
       const rateInput = document.getElementById('maxRateInput');
       if (document.activeElement !== rateInput) {
         rateInput.value = st.max_rate_mbps;
@@ -949,7 +1022,7 @@
       }
 
       tbody.innerHTML = targets.map(t => {
-        // 健康状态与指示灯
+        // 健康状态与指示灯（UI 规则 2：health=Unknown 灰色灯单独呈现）
         let healthBadge = '';
         if (t.health === 'Healthy') {
           healthBadge = `
@@ -970,11 +1043,18 @@
               <span class="w-1.5 h-1.5 rounded-full bg-red-500"></span>
               失效
             </span>`;
+        } else if (t.health === 'Unknown') {
+          // 单独呈现灰色指示灯（初始加载或待探活）
+          healthBadge = `
+            <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 border border-slate-300 dark:border-slate-600" title="初始状态，等待首次连通性探活">
+              <span class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>
+              未知 (初始)
+            </span>`;
         } else {
           healthBadge = `
             <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400 border border-slate-200 dark:border-slate-600">
               <span class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>
-              未知
+              ${escapeHtml(t.health || '未知')}
             </span>`;
         }
 
@@ -1247,7 +1327,7 @@
     });
 
     // ==========================================
-    // 5. 交互操作与 API 调用
+    // 5. 交互操作与 API 调用（UI 规则 3：失败回滚控件显示值并 toast 报错）
     // ==========================================
 
     // 一键暂停 / 恢复
@@ -1263,14 +1343,18 @@
         await fetchStatus();
       } catch (err) {
         showToast(`操作失败: ${err.message}`, 'error');
+        if (currentStatus) updateStatusView(currentStatus); // 回滚界面
       }
     }
 
-    // 修改全局限速
+    // 修改全局限速（失败回滚）
     async function saveMaxRate() {
-      const val = parseInt(document.getElementById('maxRateInput').value, 10);
+      const input = document.getElementById('maxRateInput');
+      const oldVal = currentStatus ? currentStatus.max_rate_mbps : 0;
+      const val = parseInt(input.value, 10);
       if (isNaN(val) || val < 0) {
         showToast('请输入有效的限速值（0 为不限速）', 'error');
+        input.value = oldVal;
         return;
       }
       try {
@@ -1281,16 +1365,20 @@
         showToast(`全局限速已更新为 ${val === 0 ? '不限速' : val + ' Mbps'}`, 'success');
         await fetchStatus();
       } catch (err) {
+        input.value = oldVal; // 回滚控件值
         showToast(`更新限速失败: ${err.message}`, 'error');
       }
     }
 
-    // 步进修改并发连接数 (1-10)
+    // 步进修改并发连接数 (1-10)（失败回滚）
     async function stepConnections(delta) {
       if (!currentStatus) return;
       const cur = currentStatus.max_connections || 2;
       const next = Math.max(1, Math.min(10, cur + delta));
       if (next === cur) return;
+
+      const input = document.getElementById('maxConnInput');
+      input.value = next;
 
       try {
         await apiRequest('/api/control', {
@@ -1300,12 +1388,15 @@
         showToast(`最大并发已更新为 ${next}`, 'success');
         await fetchStatus();
       } catch (err) {
+        input.value = cur; // 回滚控件值
         showToast(`更新并发数失败: ${err.message}`, 'error');
       }
     }
 
-    // 修改存储模式
+    // 修改存储模式（失败回滚）
     async function changeStorageMode(mode) {
+      const select = document.getElementById('storageModeSelect');
+      const oldMode = currentStatus ? currentStatus.storage_mode : 'discard';
       try {
         await apiRequest('/api/control', {
           method: 'POST',
@@ -1314,6 +1405,7 @@
         showToast(`存储模式已切换为 ${mode}`, 'success');
         await fetchStatus();
       } catch (err) {
+        select.value = oldMode; // 回滚控件值
         showToast(`切换存储模式失败: ${err.message}`, 'error');
       }
     }
@@ -1331,9 +1423,12 @@
 
     async function handleQuotaSubmit(e) {
       e.preventDefault();
-      const val = parseFloat(document.getElementById('quotaInput').value);
+      const input = document.getElementById('quotaInput');
+      const oldVal = currentStatus ? (currentStatus.daily_limit_gb || 0) : 0;
+      const val = parseFloat(input.value);
       if (isNaN(val) || val < 0) {
         showToast('请输入有效的配额数字（0 为不限额）', 'error');
+        input.value = oldVal;
         return;
       }
 
@@ -1343,28 +1438,40 @@
           body: JSON.stringify({ action: 'update', daily_limit_gb: val })
         });
         closeQuotaModal();
-        showToast(`每日配额已修改为 ${val === 0 ? '无限制' : val + ' GB'}`, 'success');
+        showToast(`每日配额已修改为 ${val === 0 ? '不限量' : val + ' GB'}`, 'success');
         await fetchStatus();
       } catch (err) {
+        input.value = oldVal; // 回滚
         showToast(`修改配额失败: ${err.message}`, 'error');
       }
     }
 
-    // 添加 URL 模态窗
+    // 添加 URL 模态窗（UI 规则 4：收到 409 表示 url 重复，表单内联提示）
     function openAddTargetModal() {
       document.getElementById('addName').value = '';
       document.getElementById('addUrl').value = '';
+      clearAddUrlError();
       document.getElementById('addWeight').value = '10';
       document.getElementById('addEnabled').checked = true;
       document.getElementById('addTargetModal').classList.remove('hidden');
     }
 
     function closeAddTargetModal() {
+      clearAddUrlError();
       document.getElementById('addTargetModal').classList.add('hidden');
+    }
+
+    function clearAddUrlError() {
+      const errEl = document.getElementById('addUrlError');
+      errEl.classList.add('hidden');
+      errEl.textContent = '';
+      document.getElementById('addUrl').classList.remove('border-red-500', 'focus:ring-red-500');
     }
 
     async function handleAddTargetSubmit(e) {
       e.preventDefault();
+      clearAddUrlError();
+
       const name = document.getElementById('addName').value.trim();
       const url = document.getElementById('addUrl').value.trim();
       const weight = parseInt(document.getElementById('addWeight').value, 10);
@@ -1393,6 +1500,20 @@
         await fetchTargets();
         await fetchHistory();
       } catch (err) {
+        // UI 规则 4：添加 URL 收到 409 表示 url 重复，表单内联提示
+        if (err.status === 409 || (err.message && (err.message.includes('409') || err.message.includes('exists') || err.message.includes('重复') || err.message.includes('UNIQUE')))) {
+          const errEl = document.getElementById('addUrlError');
+          errEl.innerHTML = `
+            <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            </svg>
+            <span>该 URL 已存在，请勿重复添加 (${escapeHtml(err.message)})</span>
+          `;
+          errEl.classList.remove('hidden');
+          const inputEl = document.getElementById('addUrl');
+          inputEl.classList.add('border-red-500', 'focus:ring-red-500');
+          inputEl.focus();
+        }
         showToast(`添加节点失败: ${err.message}`, 'error');
       }
     }
@@ -1443,8 +1564,15 @@
       }
     }
 
-    // 切换启用开关
+    // 切换启用开关（失败回滚）
     async function toggleTargetEnabled(id, enabled) {
+      const t = currentTargets.find(x => x.id === id);
+      const oldState = t ? t.enabled : !enabled;
+
+      // 乐观更新
+      if (t) t.enabled = enabled;
+      updateTargetsView(currentTargets);
+
       try {
         await apiRequest(`/api/targets/${id}`, {
           method: 'PUT',
@@ -1453,7 +1581,10 @@
         showToast(enabled ? '节点已启用' : '节点已禁用', 'info');
         await fetchTargets();
       } catch (err) {
-        showToast(`更新状态失败: ${err.message}`, 'error');
+        // 失败回滚
+        if (t) t.enabled = oldState;
+        updateTargetsView(currentTargets);
+        showToast(`更新节点状态失败: ${err.message}`, 'error');
       }
     }
 
