@@ -731,14 +731,20 @@ func TestStopFinalFlush(t *testing.T) {
 func TestDiscardRSSBelow30MB(t *testing.T) {
 	if os.Getenv("NETSUCK_RSS_CHILD") == "1" {
 		// 子进程：真实 HTTP 下载（discard），测总峰值 RSS（非 race 进程，M6）。
-		body := make([]byte, 4*1024*1024)
+		//
+		// 注意：服务端与客户端在同一进程内，服务端的每次分配同样计入 RSS。
+		// 因此这里必须用一块固定的小缓冲反复写，不能为每个请求分配大 body——
+		// 否则 Linux 上更大的 GC 堆会导致 RSS 虚高（历史上曾出现 78MB 假阳性）。
+		const chunkSize = 32 * 1024
+		body := make([]byte, chunkSize)
 		for i := range body {
 			body[i] = 0xAB
 		}
 		var served atomic.Int64
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			for i := 0; i < 64; i++ { // ~256MB 总量
-				served.Add(int64(len(body)))
+			// 256MB 总量，每次 32KB 流式写出，与客户端读取缓冲同量级
+			for i := 0; i < 256*1024*1024/chunkSize; i++ {
+				served.Add(chunkSize)
 				if _, err := w.Write(body); err != nil {
 					return
 				}
@@ -820,8 +826,16 @@ func TestDiscardRSSBelow30MB(t *testing.T) {
 		t.Fatalf("无法从子进程获取峰值 RSS; 输出:\n%s", out)
 	}
 	// M6：非 race 子进程测总峰值 RSS，超限即 FAIL（不做超限 Skip）。
+	// 失败时打印环境与堆统计，便于区分「客户端缓冲失控」与「运行时 GC 策略差异」。
 	if peak > 30*1024*1024 {
-		t.Fatalf("discard 真实 HTTP 下载总峰值 RSS=%d 字节 超过 30MB", peak)
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		t.Fatalf("discard 真实 HTTP 下载总峰值 RSS=%d 字节 超过 30MB\n"+
+			"  环境: GOOS=%s GOARCH=%s GOMAXPROCS=%d GOMEMLIMIT=%s GOGC=%s\n"+
+			"  子进程输出末尾:\n%s",
+			peak, runtime.GOOS, runtime.GOARCH, runtime.GOMAXPROCS(0),
+			envOr(os.Getenv("GOMEMLIMIT"), "<unset>"), envOr(os.Getenv("GOGC"), "<unset>"),
+			tailLines(string(out), 10))
 	}
 	t.Logf("discard 真实 HTTP 下载总峰值 RSS=%d 字节（<30MB）", peak)
 }
@@ -2577,4 +2591,21 @@ func TestSetSchedule(t *testing.T) {
 	if err := e.SetSchedule(ScheduleConfig{StartHour: 8, EndHour: 20}); err == nil {
 		t.Fatal("expected error when engine stopped")
 	}
+}
+
+// envOr 返回值或占位符，用于失败信息中展示环境变量。
+func envOr(v, fallback string) string {
+	if v == "" {
+		return fallback
+	}
+	return v
+}
+
+// tailLines 返回文本末尾 n 行，用于把子进程输出截断进失败信息。
+func tailLines(s string, n int) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }
