@@ -181,6 +181,24 @@ jobs:
       contents: read
       packages: write
     steps:
+      # 必须在任何用到 IMAGE_NAME 的步骤之前执行：写入 GITHUB_ENV 只对后续步骤生效，
+      # 而 GHCR 要求镜像路径全小写，owner 可能含大写。
+      - name: Set lower-case image name
+        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/netsuck" >> "$GITHUB_ENV"
+
+      # 断言后续所有步骤都能取到合法镜像名（防止步骤顺序再次被改坏）
+      - name: Assert image name is set
+        run: |
+          set -euo pipefail
+          if [ -z "${IMAGE_NAME:-}" ]; then
+            echo "::error::IMAGE_NAME is empty — env steps must run before metadata"
+            exit 1
+          fi
+          if [ "$IMAGE_NAME" != "${IMAGE_NAME,,}" ]; then
+            echo "::error::IMAGE_NAME must be lowercase: $IMAGE_NAME"
+            exit 1
+          fi
+          echo "Image name: $IMAGE_NAME"
       # 用 SHA 固定构建对象：tag 可被外部重指，SHA 不会
       - name: Checkout release commit
         uses: actions/checkout@v4
@@ -210,13 +228,26 @@ jobs:
           TAG: ${{ needs.release.outputs.tag }}
         run: |
           set -euo pipefail
-          # 拉全量远端 tags（不依赖本地 checkout 的历史，也不依赖任何历史 run 的输出）
-          git fetch --tags --force --quiet origin || true
+          # 拉全量远端 tags（不依赖本地 checkout 的历史，也不依赖任何历史 run 的输出）。
+          # 同步失败必须中止：否则会拿本地不完整的 tag 集合冒充「远端实时状态」，
+          # 可能误判为最新版本从而回退 latest 别名。
+          if ! git fetch --tags --force --quiet origin; then
+            echo "::error::failed to fetch tags from origin — refusing to decide alias eligibility"
+            exit 1
+          fi
 
-          mapfile -t all_tags < <(git tag --list 'v*')
-          result=$(python3 .github/scripts/alias_policy.py "$TAG" "${all_tags[@]}")
+          # 用主 shell 捕获失败，避免 process substitution 隐去错误
+          tags_list=$(git tag --list 'v*')
+          mapfile -t all_tags <<< "$tags_list"
+          # 过滤空行（<<< 在空输入时会产生一个空元素）
+          filtered=()
+          for t in "${all_tags[@]}"; do
+            [ -n "$t" ] && filtered+=("$t")
+          done
 
-          echo "alias decision: $result"
+          result=$(python3 .github/scripts/alias_policy.py "$TAG" "${filtered[@]+"${filtered[@]}"}")
+
+          echo "alias decision: $result (remote tags: ${#filtered[@]})"
           case "$result" in
             ok*)
               echo "push_aliases=true" >> "$GITHUB_OUTPUT"
@@ -257,9 +288,6 @@ jobs:
           tags: |
             type=semver,pattern={{version}},value=${{ needs.release.outputs.tag }}
 
-      - name: Set lower-case image name
-        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/netsuck" >> "$GITHUB_ENV"
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -272,6 +300,32 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 编排级断言：metadata 输出的每个 tag 都必须带目标仓库前缀。
+      # 若 IMAGE_NAME 在执行顺序上没被正确设置，images 会为空、tags 退化成裸 "1.2.3"，
+      # 导致镜像推不到 GHCR —— 这里提前拦截，而不是等到推送失败。
+      - name: Assert metadata tags target GHCR
+        env:
+          TAGS_FULL: ${{ steps.meta.outputs.tags }}
+          TAGS_IMMUTABLE: ${{ steps.meta_old.outputs.tags }}
+        run: |
+          set -euo pipefail
+          tags="${TAGS_FULL:-}${TAGS_IMMUTABLE:+$'\n'${TAGS_IMMUTABLE}}"
+          if [ -z "$tags" ]; then
+            echo "::error::no tags produced by metadata step"
+            exit 1
+          fi
+          bad=0
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if [[ "$line" != "${IMAGE_NAME}:"* ]]; then
+              echo "::error::tag '$line' does not start with '${IMAGE_NAME}:'"
+              bad=1
+            else
+              echo "OK: $line"
+            fi
+          done <<< "$tags"
+          exit $bad
 
       # 两条 metadata 互斥，各自用独立 build 步骤，避免依赖表达式兜底
       - name: Build and push (full aliases)

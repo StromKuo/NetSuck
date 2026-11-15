@@ -63,6 +63,7 @@ jobs:
 
       - name: Workflow YAML syntax
         run: |
+          pip3 install --quiet pyyaml
           python3 - <<'PY'
           import sys, yaml, pathlib
           ok = True
@@ -75,3 +76,12 @@ jobs:
                   print(f"FAIL {p}: {e}")
           sys.exit(0 if ok else 1)
           PY
+
+      # 发布编排的回归测试：步骤顺序（IMAGE_NAME 先于 metadata）、
+      # metadata flavor（拒绝隐式 latest）、别名判定实时性、CI 触发去重
+      - name: Release pipeline wiring tests
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/test_next_version.py
+          python3 .github/scripts/test_alias_policy.py
+          python3 .github/scripts/test_workflow_wiring.py
