@@ -53,9 +53,6 @@ jobs:
       released: ${{ steps.plan.outputs.released }}
       tag: ${{ steps.plan.outputs.tag }}
       sha: ${{ steps.plan.outputs.sha }}
-      # 是否为「补推历史版本」：补推时只推不可变精确版本标签，
-      # 不得把 latest / major / major.minor 别名回退到旧镜像。
-      resuming_old: ${{ steps.plan.outputs.resuming_old }}
     steps:
       - name: Checkout (full history + tags)
         uses: actions/checkout@v4
@@ -71,10 +68,11 @@ jobs:
           set -euo pipefail
           sha=$(git rev-parse HEAD)
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "resuming_old=false" >> "$GITHUB_OUTPUT"
 
           # 幂等恢复：该 commit 若已带严格稳定版本 tag，直接沿用（补建 Release/镜像）。
           # 用 Python 的 STABLE_TAG_RE 判定，不使用宽松数字正则（避免接纳 v01.2.3）。
+          # 注意：这里不判断「是否历史版本」——那取决于发布那一刻远端的真实最新版本，
+          # 必须放到 publish job 实时查询，不能依赖本次 HEAD 的祖先集合或历史 run 的输出。
           existing=$(python3 - <<'PY'
           import subprocess, sys
           sys.path.insert(0, ".github/scripts")
@@ -88,18 +86,6 @@ jobs:
           )
           if [ -n "${existing:-}" ]; then
             echo "Commit $sha already tagged $existing — resuming publication."
-            # 若该 tag 不是当前最新稳定版本，说明在补推历史版本：别名不得回退
-            newest=$(python3 - <<'PY'
-          import sys
-          sys.path.insert(0, ".github/scripts")
-          from next_version import latest_stable_tag
-          print(latest_stable_tag() or "")
-          PY
-            )
-            if [ "$existing" != "$newest" ]; then
-              echo "::notice::$existing is older than $newest — will only push immutable version tag."
-              echo "resuming_old=true" >> "$GITHUB_OUTPUT"
-            fi
             echo "released=true" >> "$GITHUB_OUTPUT"
             echo "tag=$existing" >> "$GITHUB_OUTPUT"
             exit 0
@@ -151,9 +137,12 @@ jobs:
           echo "released=true" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - name: Run version classifier tests
+      - name: Run release policy tests
         if: steps.plan.outputs.released == 'true'
-        run: python3 .github/scripts/test_next_version.py
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/test_next_version.py
+          python3 .github/scripts/test_alias_policy.py
 
       - name: Create and push tag
         if: steps.plan.outputs.released == 'true'
@@ -188,6 +177,9 @@ jobs:
     needs: release
     if: needs.release.outputs.released == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       # 用 SHA 固定构建对象：tag 可被外部重指，SHA 不会
       - name: Checkout release commit
@@ -209,6 +201,62 @@ jobs:
           fi
           echo "Tag $TAG -> $SHA verified."
 
+      # 关键：是否允许推送 latest/MAJOR/MINOR 别名，必须在推送这一刻查询远端真实状态。
+      # 不能依赖 release job 的祖先集合（重跑旧 SHA 时看不到后代 tag），
+      # 也不能依赖历史 run 的输出（只重跑 publish 会沿用旧的错误值）。
+      - name: Decide alias eligibility from remote tags
+        id: aliases
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # 拉全量远端 tags（不依赖本地 checkout 的历史，也不依赖任何历史 run 的输出）
+          git fetch --tags --force --quiet origin || true
+
+          mapfile -t all_tags < <(git tag --list 'v*')
+          result=$(python3 .github/scripts/alias_policy.py "$TAG" "${all_tags[@]}")
+
+          echo "alias decision: $result"
+          case "$result" in
+            ok*)
+              echo "push_aliases=true" >> "$GITHUB_OUTPUT"
+              ;;
+            backfill*)
+              echo "::notice::$TAG is not the newest remote tag ($result) — immutable version tag only."
+              echo "push_aliases=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::unexpected alias decision: $result"
+              exit 1
+              ;;
+          esac
+
+      # 正常发版：推精确版本 + major.minor + major + latest
+      - name: Extract Docker metadata (full aliases)
+        if: steps.aliases.outputs.push_aliases == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=true
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.release.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ needs.release.outputs.tag }}
+
+      # 补推历史版本：只推不可变精确版本，且显式关闭 metadata-action 的隐式 latest
+      - name: Extract Docker metadata (immutable only)
+        if: steps.aliases.outputs.push_aliases != 'true'
+        id: meta_old
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.release.outputs.tag }}
+
       - name: Set lower-case image name
         run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/netsuck" >> "$GITHUB_ENV"
 
@@ -225,37 +273,30 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 正常发版：推精确版本 + major.minor + major + latest
-      # 补推历史版本（resuming_old=true）：只推不可变精确版本，避免 latest/major/minor 别名回退
-      - name: Extract Docker metadata (new release)
-        if: needs.release.outputs.resuming_old != 'true'
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}},value=${{ needs.release.outputs.tag }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release.outputs.tag }}
-            type=semver,pattern={{major}},value=${{ needs.release.outputs.tag }}
-            type=raw,value=latest
-
-      - name: Extract Docker metadata (backfill old release)
-        if: needs.release.outputs.resuming_old == 'true'
-        id: meta_old
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}},value=${{ needs.release.outputs.tag }}
-
-      - name: Build and push Docker image
+      # 两条 metadata 互斥，各自用独立 build 步骤，避免依赖表达式兜底
+      - name: Build and push (full aliases)
+        if: steps.aliases.outputs.push_aliases == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags || steps.meta_old.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels || steps.meta_old.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.release.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push (immutable version only)
+        if: steps.aliases.outputs.push_aliases != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta_old.outputs.tags }}
+          labels: ${{ steps.meta_old.outputs.labels }}
           build-args: |
             VERSION=${{ needs.release.outputs.tag }}
           cache-from: type=gha
