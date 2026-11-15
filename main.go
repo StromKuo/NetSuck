@@ -432,11 +432,41 @@ func (s *server) handleControlUpdate(w http.ResponseWriter, raw map[string]json.
 	}
 
 	if v, ok := raw["schedule"]; ok {
-		var val ScheduleConfig
-		if err := json.Unmarshal(v, &val); err != nil {
+		var rawSched map[string]json.RawMessage
+		if err := json.Unmarshal(v, &rawSched); err != nil {
 			writeJSONError(w, http.StatusBadRequest, "invalid schedule")
 			return
 		}
+		for sk, sv := range rawSched {
+			if bytes.Equal(bytes.TrimSpace(sv), []byte("null")) {
+				writeJSONError(w, http.StatusBadRequest, "field "+sk+" in schedule cannot be null")
+				return
+			}
+			switch sk {
+			case "start_hour", "end_hour":
+			default:
+				writeJSONError(w, http.StatusBadRequest, "unknown field in schedule: "+sk)
+				return
+			}
+		}
+
+		type scheduleDTO struct {
+			StartHour *int `json:"start_hour"`
+			EndHour   *int `json:"end_hour"`
+		}
+		var dto scheduleDTO
+		dec := json.NewDecoder(bytes.NewReader(v))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&dto); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid schedule: "+err.Error())
+			return
+		}
+		if dto.StartHour == nil || dto.EndHour == nil {
+			writeJSONError(w, http.StatusBadRequest, "schedule requires both start_hour and end_hour")
+			return
+		}
+
+		val := ScheduleConfig{StartHour: *dto.StartHour, EndHour: *dto.EndHour}
 		if err := ValidateSchedule(val); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return

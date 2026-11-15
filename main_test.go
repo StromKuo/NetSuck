@@ -571,4 +571,151 @@ func TestControlUpdateSchedule(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for null schedule, got %d", rec.Code)
 	}
+
+	// 7. 子字段为 null、缺失或包含未知字段 -> 均必须返回 400，且运行态与持久化配置文件保持不变
+	// 先将 schedule 设置为基准值 23→7
+	req = httptest.NewRequest(http.MethodPost, "/api/control", bytes.NewReader([]byte(`{"action":"update","schedule":{"start_hour":23,"end_hour":7}}`)))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("setup baseline schedule failed: %d", rec.Code)
+	}
+
+	invalidPayloads := []string{
+		`{"action":"update","schedule":{"start_hour":null,"end_hour":7}}`,
+		`{"action":"update","schedule":{"start_hour":23,"end_hour":null}}`,
+		`{"action":"update","schedule":{"start_hour":null,"end_hour":null}}`,
+		`{"action":"update","schedule":{"start_hour":23}}`,
+		`{"action":"update","schedule":{"end_hour":7}}`,
+		`{"action":"update","schedule":{"start_hour":23,"end_hour":7,"unknown_field":1}}`,
+	}
+
+	for _, payload := range invalidPayloads {
+		req = httptest.NewRequest(http.MethodPost, "/api/control", bytes.NewReader([]byte(payload)))
+		rec = httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("payload %s expected 400, got %d: %s", payload, rec.Code, rec.Body.String())
+		}
+
+		// 断言运行态不变
+		curSnap := srv.engine.Snapshot()
+		if curSnap.Schedule.StartHour != 23 || curSnap.Schedule.EndHour != 7 {
+			t.Fatalf("payload %s mutated running schedule: got %+v", payload, curSnap.Schedule)
+		}
+
+		// 断言配置文件不变
+		curLoaded, err := LoadConfig(configPath)
+		if err != nil {
+			t.Fatalf("load config: %v", err)
+		}
+		if curLoaded.Schedule.StartHour != 23 || curLoaded.Schedule.EndHour != 7 {
+			t.Fatalf("payload %s mutated persisted schedule: got %+v", payload, curLoaded.Schedule)
+		}
+	}
+}
+
+func TestControlUpdateScheduleValidation(t *testing.T) {
+	srv, configPath := setupTestServer(t)
+	handler := srv.routes()
+
+	post := func(t *testing.T, payload string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/control", bytes.NewReader([]byte(payload)))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	statusSchedule := func(t *testing.T) ScheduleConfig {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /api/status: expected 200, got %d (%s)", rec.Code, rec.Body.String())
+		}
+		var body struct {
+			Schedule ScheduleConfig `json:"schedule"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode /api/status: %v", err)
+		}
+		return body.Schedule
+	}
+
+	persistedSchedule := func(t *testing.T) ScheduleConfig {
+		t.Helper()
+		loaded, err := LoadConfig(configPath)
+		if err != nil {
+			t.Fatalf("load config: %v", err)
+		}
+		return loaded.Schedule
+	}
+
+	assertUnchanged := func(t *testing.T, want ScheduleConfig) {
+		t.Helper()
+		if got := statusSchedule(t); got != want {
+			t.Fatalf("running schedule via /api/status changed: want %+v, got %+v", want, got)
+		}
+		if got := srv.engine.Snapshot().Schedule; got != want {
+			t.Fatalf("engine snapshot schedule changed: want %+v, got %+v", want, got)
+		}
+		if got := persistedSchedule(t); got != want {
+			t.Fatalf("persisted schedule changed: want %+v, got %+v", want, got)
+		}
+	}
+
+	baseline := statusSchedule(t)
+
+	invalid := []struct {
+		name    string
+		payload string
+	}{
+		{"start_hour null", `{"action":"update","schedule":{"start_hour":null,"end_hour":7}}`},
+		{"end_hour null", `{"action":"update","schedule":{"start_hour":23,"end_hour":null}}`},
+		{"unknown sub field", `{"action":"update","schedule":{"start_hour":1,"end_hour":7,"foo":1}}`},
+		{"start_hour too big", `{"action":"update","schedule":{"start_hour":25,"end_hour":7}}`},
+		{"start_hour negative", `{"action":"update","schedule":{"start_hour":-1,"end_hour":7}}`},
+		{"end_hour too big", `{"action":"update","schedule":{"start_hour":1,"end_hour":25}}`},
+		{"start equals end", `{"action":"update","schedule":{"start_hour":9,"end_hour":9}}`},
+	}
+
+	for _, tc := range invalid {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := post(t, tc.payload)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d (%s)", rec.Code, rec.Body.String())
+			}
+			assertUnchanged(t, baseline)
+		})
+	}
+
+	t.Run("valid cross-night 23 to 7", func(t *testing.T) {
+		rec := post(t, `{"action":"update","schedule":{"start_hour":23,"end_hour":7}}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d (%s)", rec.Code, rec.Body.String())
+		}
+
+		want := ScheduleConfig{StartHour: 23, EndHour: 7}
+		if got := statusSchedule(t); got != want {
+			t.Fatalf("/api/status schedule: want %+v, got %+v", want, got)
+		}
+		if got := srv.engine.Snapshot().Schedule; got != want {
+			t.Fatalf("engine snapshot schedule: want %+v, got %+v", want, got)
+		}
+		if got := persistedSchedule(t); got != want {
+			t.Fatalf("LoadConfig schedule: want %+v, got %+v", want, got)
+		}
+
+		raw, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatalf("read config file: %v", err)
+		}
+		for _, needle := range []string{"start_hour: 23", "end_hour: 7"} {
+			if !bytes.Contains(raw, []byte(needle)) {
+				t.Fatalf("config file missing %q, content:\n%s", needle, raw)
+			}
+		}
+	})
 }
