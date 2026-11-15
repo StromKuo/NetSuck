@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2413,6 +2414,9 @@ func (e *Engine) Snapshot() EngineSnapshot {
 		snap.Targets = append(snap.Targets, ts)
 	}
 	e.stateMu.RUnlock()
+	sort.Slice(snap.Targets, func(i, j int) bool {
+		return snap.Targets[i].ID < snap.Targets[j].ID
+	})
 	return snap
 }
 
@@ -2534,6 +2538,22 @@ func (e *Engine) SetDailyLimit(gb float64) error {
 	if err := e.applyDailyLimit(int64(gb * 1e9)); err != nil {
 		return err // E1：排空失败不发布，保留旧配置
 	}
+	e.recomputeGate()
+	return nil
+}
+
+func (e *Engine) SetSchedule(s ScheduleConfig) error {
+	if err := ValidateSchedule(s); err != nil {
+		return wrapValidation(err)
+	}
+	e.adminMu.Lock()
+	defer e.adminMu.Unlock()
+	if e.stopped.Load() {
+		return errors.New("engine stopped")
+	}
+	e.stateMu.Lock()
+	e.schedule = s
+	e.stateMu.Unlock()
 	e.recomputeGate()
 	return nil
 }

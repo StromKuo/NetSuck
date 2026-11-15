@@ -319,7 +319,7 @@ func (s *server) handlePostControl(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		switch k {
-		case "action", "max_rate_mbps", "max_connections", "daily_limit_gb", "storage_mode":
+		case "action", "max_rate_mbps", "max_connections", "daily_limit_gb", "storage_mode", "schedule":
 		default:
 			writeJSONError(w, http.StatusBadRequest, "unknown field: "+k)
 			return
@@ -429,6 +429,19 @@ func (s *server) handleControlUpdate(w http.ResponseWriter, raw map[string]json.
 			return
 		}
 		candidate.StorageMode = val
+	}
+
+	if v, ok := raw["schedule"]; ok {
+		var val ScheduleConfig
+		if err := json.Unmarshal(v, &val); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid schedule")
+			return
+		}
+		if err := ValidateSchedule(val); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		candidate.Schedule = val
 	}
 
 	if err := candidate.Validate(); err != nil {

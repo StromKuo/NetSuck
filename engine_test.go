@@ -2519,3 +2519,62 @@ func TestM3ReReserveShrinkKeepsPaidBudget(t *testing.T) {
 	case <-time.After(3 * time.Second):
 	}
 }
+
+func TestSnapshotTargetsSortedStable(t *testing.T) {
+	e, _ := newTestEngine(t, nil, true)
+	ids := []int64{42, 5, 100, 1, 17, 3, 88, 12, 999, 2}
+	e.stateMu.Lock()
+	for _, id := range ids {
+		e.targets[id] = &target{
+			id:    id,
+			name:  fmt.Sprintf("target-%d", id),
+			url:   fmt.Sprintf("http://127.0.0.1/test-%d", id),
+			total: new(atomic.Int64),
+		}
+	}
+	e.stateMu.Unlock()
+
+	for iter := 0; iter < 10; iter++ {
+		snap := e.Snapshot()
+		if len(snap.Targets) != len(ids) {
+			t.Fatalf("iter %d: expected %d targets, got %d", iter, len(ids), len(snap.Targets))
+		}
+		for i := 1; i < len(snap.Targets); i++ {
+			if snap.Targets[i-1].ID >= snap.Targets[i].ID {
+				t.Fatalf("iter %d: targets not sorted by ID ascending: index %d id=%d, index %d id=%d",
+					iter, i-1, snap.Targets[i-1].ID, i, snap.Targets[i].ID)
+			}
+		}
+	}
+}
+
+func TestSetSchedule(t *testing.T) {
+	e, _ := newTestEngine(t, nil, true)
+
+	// 合法 schedule
+	sched := ScheduleConfig{StartHour: 23, EndHour: 7}
+	if err := e.SetSchedule(sched); err != nil {
+		t.Fatalf("SetSchedule valid failed: %v", err)
+	}
+	snap := e.Snapshot()
+	if snap.Schedule.StartHour != 23 || snap.Schedule.EndHour != 7 {
+		t.Fatalf("snapshot schedule mismatch: got %+v", snap.Schedule)
+	}
+
+	// 非法 schedule 校验
+	if err := e.SetSchedule(ScheduleConfig{StartHour: -1, EndHour: 10}); err == nil {
+		t.Fatal("expected error for StartHour < 0")
+	}
+	if err := e.SetSchedule(ScheduleConfig{StartHour: 10, EndHour: 25}); err == nil {
+		t.Fatal("expected error for EndHour > 24")
+	}
+	if err := e.SetSchedule(ScheduleConfig{StartHour: 8, EndHour: 8}); err == nil {
+		t.Fatal("expected error for StartHour == EndHour")
+	}
+
+	// 停止后拒绝
+	e.stopped.Store(true)
+	if err := e.SetSchedule(ScheduleConfig{StartHour: 8, EndHour: 20}); err == nil {
+		t.Fatal("expected error when engine stopped")
+	}
+}

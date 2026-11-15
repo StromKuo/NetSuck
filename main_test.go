@@ -488,3 +488,87 @@ func TestValidationErrorClassification(t *testing.T) {
 		t.Errorf("nil error should not be recognized as validation error")
 	}
 }
+
+func TestControlUpdateSchedule(t *testing.T) {
+	srv, configPath := setupTestServer(t)
+	handler := srv.routes()
+
+	// 1. 成功更新为跨夜时段
+	req := httptest.NewRequest(http.MethodPost, "/api/control", bytes.NewReader([]byte(`{"action":"update","schedule":{"start_hour":23,"end_hour":7}}`)))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for valid schedule update, got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	snap := srv.engine.Snapshot()
+	if snap.Schedule.StartHour != 23 || snap.Schedule.EndHour != 7 {
+		t.Errorf("snapshot schedule mismatch: got %+v", snap.Schedule)
+	}
+
+	loaded, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if loaded.Schedule.StartHour != 23 || loaded.Schedule.EndHour != 7 {
+		t.Errorf("persisted schedule mismatch: got %+v", loaded.Schedule)
+	}
+
+	// 2. 成功更新为全天时段
+	req = httptest.NewRequest(http.MethodPost, "/api/control", bytes.NewReader([]byte(`{"action":"update","schedule":{"start_hour":0,"end_hour":24}}`)))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for 0-24 schedule update, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	snap = srv.engine.Snapshot()
+	if snap.Schedule.StartHour != 0 || snap.Schedule.EndHour != 24 {
+		t.Errorf("snapshot schedule mismatch: got %+v", snap.Schedule)
+	}
+
+	// 3. 非法 schedule：start_hour 超出 [0, 23]
+	req = httptest.NewRequest(http.MethodPost, "/api/control", bytes.NewReader([]byte(`{"action":"update","schedule":{"start_hour":-1,"end_hour":8}}`)))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for start_hour < 0, got %d", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/control", bytes.NewReader([]byte(`{"action":"update","schedule":{"start_hour":24,"end_hour":8}}`)))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for start_hour > 23, got %d", rec.Code)
+	}
+
+	// 4. 非法 schedule：end_hour 超出 [0, 24]
+	req = httptest.NewRequest(http.MethodPost, "/api/control", bytes.NewReader([]byte(`{"action":"update","schedule":{"start_hour":8,"end_hour":25}}`)))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for end_hour > 24, got %d", rec.Code)
+	}
+
+	// 5. 非法 schedule：start == end
+	req = httptest.NewRequest(http.MethodPost, "/api/control", bytes.NewReader([]byte(`{"action":"update","schedule":{"start_hour":9,"end_hour":9}}`)))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for start == end, got %d", rec.Code)
+	}
+
+	// 6. 非法类型与 null
+	req = httptest.NewRequest(http.MethodPost, "/api/control", bytes.NewReader([]byte(`{"action":"update","schedule":"invalid"}`)))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-object schedule, got %d", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/control", bytes.NewReader([]byte(`{"action":"update","schedule":null}`)))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for null schedule, got %d", rec.Code)
+	}
+}
