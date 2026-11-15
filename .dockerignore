@@ -1,0 +1,18 @@
+# 构建上下文中排除非必要文件，加快 CI 构建并避免无意义的缓存失效
+.git/
+.github/
+docs/
+*.md
+!README.md
+
+# 本地产物与数据
+netsuck
+*.db
+*.db-wal
+*.db-shm
+data/
+
+# IDE / 系统
+.DS_Store
+.idea/
+.vscode/

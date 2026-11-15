@@ -1,0 +1,61 @@
+name: Tag Release
+
+# 手动一键发版：在 Actions 页面选择 patch / minor / major，自动打 tag 并触发 Release 工作流。
+# 适用于需要强制推进版本、或自动发版未覆盖的场景（如跳过 release、批量合并后一次性发版）。
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: '版本升级类型'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Compute and push tag
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+
+          latest=$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)
+          if [ -z "$latest" ]; then
+            latest="v0.0.0"
+          fi
+          echo "Latest tag: $latest"
+
+          version="${latest#v}"
+          major=$(echo "$version" | cut -d. -f1)
+          minor=$(echo "$version" | cut -d. -f2)
+          patch=$(echo "$version" | cut -d. -f3)
+
+          case "$BUMP" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+            *) echo "Unknown bump type: $BUMP"; exit 1 ;;
+          esac
+
+          new_tag="v${major}.${minor}.${patch}"
+          echo "Creating tag: $new_tag"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$new_tag" -m "Release $new_tag (manual $BUMP)"
+          git push origin "$new_tag"

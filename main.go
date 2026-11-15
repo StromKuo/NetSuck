@@ -71,7 +71,20 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 	snap := s.engine.Snapshot()
-	writeJSON(w, http.StatusOK, snap)
+	// 版本号由构建期注入，不属于引擎状态，因此在 handler 层附加。
+	body, err := json.Marshal(snap)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "encode status failed")
+		return
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "encode status failed")
+		return
+	}
+	versionJSON, _ := json.Marshal(buildVersion)
+	payload["version"] = versionJSON
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *server) handleGetTargets(w http.ResponseWriter, r *http.Request) {
@@ -627,15 +640,25 @@ func ensureConfigFile(targetPath string) error {
 	return nil
 }
 
+// buildVersion 由构建时通过 -ldflags "-X main.buildVersion=..." 注入（CI 使用 git tag）。
+var buildVersion = "dev"
+
 func main() {
 	log.SetOutput(os.Stdout)
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 
 	configFlag := flag.String("config", "/data/config.yaml", "path to config file")
+	versionFlag := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Printf("netsuck %s\n", buildVersion)
+		return
+	}
+
 	configPath := *configFlag
 
-	log.Printf("NetSuck starting, config path: %s", configPath)
+	log.Printf("NetSuck %s starting, config path: %s", buildVersion, configPath)
 
 	if err := ensureConfigFile(configPath); err != nil {
 		log.Fatalf("failed to ensure config file: %v", err)

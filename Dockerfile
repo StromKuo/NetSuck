@@ -1,6 +1,9 @@
 # Build stage
 FROM golang:1.23-alpine AS builder
 
+# 版本号由 CI 通过 --build-arg 注入（如 v1.2.3）；本地构建默认 dev
+ARG VERSION=dev
+
 WORKDIR /build
 
 # 预先下载依赖以提升 Docker 缓存命中率
@@ -10,7 +13,9 @@ RUN go mod download
 # 复制源码并执行静态编译
 # 注意：CGO_ENABLED=0 禁用 CGO，GOARCH 由 buildx 目标平台环境变量自动注入，避免硬编码
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o netsuck .
+RUN CGO_ENABLED=0 go build \
+        -ldflags="-s -w -X main.buildVersion=${VERSION}" \
+        -trimpath -o netsuck .
 
 # Runtime stage
 FROM alpine:3.20
@@ -35,5 +40,11 @@ USER netsuck
 VOLUME ["/data"]
 
 EXPOSE 8080
+
+LABEL org.opencontainers.image.title="NetSuck" \
+      org.opencontainers.image.description="Because asymmetrical throttling sucks. — 为 NAS 打造的轻量级 HTTP/HTTPS 下行流量生成与上下行带宽平衡工具" \
+      org.opencontainers.image.source="https://github.com/StromKuo/NetSuck" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${VERSION}"
 
 ENTRYPOINT ["/app/netsuck", "-config", "/data/config.yaml"]
