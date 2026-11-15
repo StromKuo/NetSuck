@@ -160,6 +160,8 @@ docker run -d \
 
 ## 🖥️ Web 监控面板功能
 
+![NetSuck 监控面板](docs/images/dashboard.png)
+
 NetSuck 内置单文件响应式 Web 仪表盘，无需安装额外插件即可在手机或桌面浏览器上舒适操作：
 
 1. **核心概览卡片**：
