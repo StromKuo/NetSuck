@@ -20,6 +20,9 @@ RUN CGO_ENABLED=0 go build \
 # Runtime stage
 FROM alpine:3.20
 
+# ARG 不跨阶段继承，runtime 阶段需重新声明才能用于 LABEL
+ARG VERSION=dev
+
 # 安装根证书与时区数据
 RUN apk --no-cache add ca-certificates tzdata
 

@@ -70,21 +70,15 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleGetStatus(w http.ResponseWriter, r *http.Request) {
-	snap := s.engine.Snapshot()
-	// 版本号由构建期注入，不属于引擎状态，因此在 handler 层附加。
-	body, err := json.Marshal(snap)
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "encode status failed")
-		return
-	}
-	var payload map[string]json.RawMessage
-	if err := json.Unmarshal(body, &payload); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "encode status failed")
-		return
-	}
-	versionJSON, _ := json.Marshal(buildVersion)
-	payload["version"] = versionJSON
-	writeJSON(w, http.StatusOK, payload)
+	// 版本号由构建期注入，不属于引擎状态，因此在此处叠加一层，不污染引擎契约。
+	// 匿名嵌入保证 EngineSnapshot 的既有字段名与类型原样输出，仅多出 version。
+	writeJSON(w, http.StatusOK, struct {
+		EngineSnapshot
+		Version string `json:"version"`
+	}{
+		EngineSnapshot: s.engine.Snapshot(),
+		Version:        buildVersion,
+	})
 }
 
 func (s *server) handleGetTargets(w http.ResponseWriter, r *http.Request) {

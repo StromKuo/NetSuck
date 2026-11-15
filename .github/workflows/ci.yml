@@ -5,7 +5,7 @@ name: CI
 on:
   push:
     branches: [main]
-    paths:
+    paths: &code_paths
       - '**.go'
       - 'go.mod'
       - 'go.sum'
@@ -14,14 +14,9 @@ on:
       - 'Dockerfile'
       - '.dockerignore'
   pull_request:
-    paths:
-      - '**.go'
-      - 'go.mod'
-      - 'go.sum'
-      - 'web/**'
-      - 'config.example.yaml'
-      - 'Dockerfile'
-      - '.dockerignore'
+    paths: *code_paths
+  # 供 release.yml 通过 workflow_call 复用，保证发版前一定跑过完整校验
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -65,3 +60,18 @@ jobs:
         run: |
           go build -ldflags "-X main.buildVersion=ci-test" -o /tmp/netsuck-version .
           test "$(/tmp/netsuck-version -version)" = "netsuck ci-test"
+
+      - name: Workflow YAML syntax
+        run: |
+          python3 - <<'PY'
+          import sys, yaml, pathlib
+          ok = True
+          for p in sorted(pathlib.Path('.github/workflows').glob('*.yml')):
+              try:
+                  yaml.safe_load(p.read_text())
+                  print(f"OK   {p}")
+              except Exception as e:
+                  ok = False
+                  print(f"FAIL {p}: {e}")
+          sys.exit(0 if ok else 1)
+          PY

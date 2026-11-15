@@ -1,15 +1,17 @@
 name: Release
 
-# 合入 main 时自动推算语义化版本：读自上一条 tag 以来的 commit message。
-#   fix: / perf: / refactor:                 -> patch
-#   feat:                                    -> minor
-#   type!: 或 commit body 含 BREAKING CHANGE -> major
-# 若没有可发布的改动（只有 docs/chore/test 等），则跳过发版。
-# 也可以手动触发并指定升级类型（通过 tag-release.yml）。
+# 合入 main 时自动推算语义化版本并完整发布（校验 -> 打 tag -> Release -> 镜像）。
+#
+# 设计要点（对应 T16 审查发现的阻断项）：
+# 1. 发版前强制跑完整校验（复用 ci.yml 的 verify），红灯不发版；
+# 2. 唯一发布入口：手动发版也走这里（workflow_dispatch 带 bump 输入），避免
+#    "手动只打 tag、GITHUB_TOKEN 推 tag 不触发后续 workflow"导致的漏发布；
+# 3. 幂等恢复：若目标 commit 已有 tag 但 Release/镜像缺失，重跑会补齐而不是卡住；
+# 4. 版本推算逻辑在 .github/scripts/next_version.py（有回归测试，规避 SIGPIPE）。
 on:
   push:
     branches: [main]
-    paths:
+    paths: &code_paths
       - '**.go'
       - 'go.mod'
       - 'go.sum'
@@ -18,114 +20,159 @@ on:
       - 'Dockerfile'
       - '.dockerignore'
   workflow_dispatch:
+    inputs:
+      bump:
+        description: '手动强制升级类型（留空则按 commit 自动推断）'
+        required: false
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+        default: auto
 
 permissions:
   contents: write
   packages: write
 
+# 自动与手动发版共享同一把锁，防止两方从同一个 latest 算出同一个 tag 互相抢占
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
+  # 发版前必须通过的校验（失败则整个发布链中止）
+  verify:
+    uses: ./.github/workflows/ci.yml
+
   release:
+    needs: verify
     runs-on: ubuntu-latest
     outputs:
-      released: ${{ steps.bump.outputs.released }}
-      new_tag: ${{ steps.bump.outputs.new_tag }}
+      released: ${{ steps.plan.outputs.released }}
+      tag: ${{ steps.plan.outputs.tag }}
+      sha: ${{ steps.plan.outputs.sha }}
     steps:
-      - name: Checkout (full history for tags)
+      - name: Checkout (full history + tags)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Compute next semantic version
-        id: bump
+      - name: Plan release (idempotent)
+        id: plan
+        env:
+          BUMP_INPUT: ${{ inputs.bump }}
         run: |
           set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
-          latest=$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)
-          if [ -z "$latest" ]; then
-            latest="v0.0.0"
-            range=""
-            echo "No previous tag; starting from $latest"
-          else
-            range="${latest}..HEAD"
-            echo "Latest tag: $latest"
-          fi
-
-          if [ -n "$range" ]; then
-            commits=$(git log "$range" --pretty=format:'%s%n%b%n---END---')
-          else
-            commits=$(git log --pretty=format:'%s%n%b%n---END---')
-          fi
-
-          bump="none"
-          if printf '%s' "$commits" | grep -qE '^[a-zA-Z0-9_-]+(\(.*\))?!:|BREAKING CHANGE:'; then
-            bump="major"
-          elif printf '%s' "$commits" | grep -qE '^feat(\(.*\))?:'; then
-            bump="minor"
-          elif printf '%s' "$commits" | grep -qE '^(fix|perf|refactor)(\(.*\))?:'; then
-            bump="patch"
-          fi
-
-          echo "Detected bump type: $bump"
-
-          if [ "$bump" = "none" ]; then
-            echo "released=false" >> "$GITHUB_OUTPUT"
-            echo "No release-worthy commits since $latest — skipping release."
+          # 幂等恢复：该 commit 若已带稳定版本 tag，直接沿用（补建 Release/镜像）
+          existing=$(git tag --points-at HEAD --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)
+          if [ -n "${existing:-}" ]; then
+            echo "Commit $sha already tagged $existing — resuming publication."
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$existing" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          version="${latest#v}"
-          major=$(echo "$version" | cut -d. -f1)
-          minor=$(echo "$version" | cut -d. -f2)
-          patch=$(echo "$version" | cut -d. -f3)
+          latest=$(python3 - <<'PY'
+          import subprocess, sys
+          sys.path.insert(0, ".github/scripts")
+          from next_version import latest_stable_tag
+          print(latest_stable_tag() or "")
+          PY
+          )
 
-          case "$bump" in
-            major) major=$((major + 1)); minor=0; patch=0 ;;
-            minor) minor=$((minor + 1)); patch=0 ;;
-            patch) patch=$((patch + 1)) ;;
-          esac
+          if [ -n "${BUMP_INPUT:-}" ] && [ "${BUMP_INPUT}" != "auto" ]; then
+            if [ -z "$latest" ]; then
+              echo "::error::manual bump requires an existing stable tag as base"
+              exit 1
+            fi
+            tag=$(python3 - "$latest" "$BUMP_INPUT" <<'PY'
+          import sys
+          sys.path.insert(0, ".github/scripts")
+          from next_version import bump_version
+          print(bump_version(sys.argv[1], sys.argv[2]))
+          PY
+            )
+          else
+            result=$(python3 - <<'PY'
+          import subprocess, sys
+          sys.path.insert(0, ".github/scripts")
+          from next_version import classify, parse_commits, latest_stable_tag, bump_version
+          latest = latest_stable_tag()
+          rng = f"{latest}..HEAD" if latest else "HEAD"
+          raw = subprocess.run(["git","log",rng,"--pretty=format:%s%n%b%x00"],
+                               check=True, capture_output=True, text=True).stdout
+          bump = classify(parse_commits(raw))
+          if bump == "none":
+              print("none")
+          else:
+              print(bump_version(latest, bump))
+          PY
+            )
+            if [ "$result" = "none" ]; then
+              echo "No release-worthy commits (no feat/fix/perf/refactor/breaking)."
+              echo "released=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            tag="$result"
+          fi
 
-          new_tag="v${major}.${minor}.${patch}"
-          echo "Next tag: $new_tag"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "::error::tag $tag already exists but not at HEAD; refusing to move it"
+            exit 1
+          fi
+
+          echo "Planned tag: $tag at $sha"
           echo "released=true" >> "$GITHUB_OUTPUT"
-          echo "new_tag=$new_tag" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Run version classifier tests
+        if: steps.plan.outputs.released == 'true'
+        run: python3 .github/scripts/test_next_version.py
 
       - name: Create and push tag
-        if: steps.bump.outputs.released == 'true'
+        if: steps.plan.outputs.released == 'true'
         env:
-          NEW_TAG: ${{ steps.bump.outputs.new_tag }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          SHA: ${{ steps.plan.outputs.sha }}
         run: |
           set -euo pipefail
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists; nothing to push."
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$NEW_TAG" -m "Release $NEW_TAG"
-          git push origin "$NEW_TAG"
+          git tag -a "$TAG" "$SHA" -m "Release $TAG"
+          git push origin "$TAG"
 
-      - name: Create GitHub Release
-        if: steps.bump.outputs.released == 'true'
+      - name: Create GitHub Release (idempotent)
+        if: steps.plan.outputs.released == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NEW_TAG: ${{ steps.bump.outputs.new_tag }}
+          TAG: ${{ steps.plan.outputs.tag }}
         run: |
           set -euo pipefail
-          gh release create "$NEW_TAG" \
-            --title "$NEW_TAG" \
-            --generate-notes \
-            --verify-tag
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists."
+            exit 0
+          fi
+          gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag
 
-  # 发版成功后构建并推送镜像（复用 tag 事件的工作流逻辑，单独成 job 以便失败可重跑）
   publish:
     needs: release
     if: needs.release.outputs.released == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout release tag
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.release.outputs.tag }}
           fetch-depth: 0
 
       - name: Set lower-case image name
@@ -150,9 +197,9 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}},value=${{ needs.release.outputs.new_tag }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release.outputs.new_tag }}
-            type=semver,pattern={{major}},value=${{ needs.release.outputs.new_tag }}
+            type=semver,pattern={{version}},value=${{ needs.release.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ needs.release.outputs.tag }}
             type=raw,value=latest
 
       - name: Build and push Docker image
@@ -164,6 +211,6 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=${{ needs.release.outputs.new_tag }}
+            VERSION=${{ needs.release.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
