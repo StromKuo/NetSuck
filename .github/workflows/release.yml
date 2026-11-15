@@ -53,6 +53,9 @@ jobs:
       released: ${{ steps.plan.outputs.released }}
       tag: ${{ steps.plan.outputs.tag }}
       sha: ${{ steps.plan.outputs.sha }}
+      # 是否为「补推历史版本」：补推时只推不可变精确版本标签，
+      # 不得把 latest / major / major.minor 别名回退到旧镜像。
+      resuming_old: ${{ steps.plan.outputs.resuming_old }}
     steps:
       - name: Checkout (full history + tags)
         uses: actions/checkout@v4
@@ -68,29 +71,48 @@ jobs:
           set -euo pipefail
           sha=$(git rev-parse HEAD)
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "resuming_old=false" >> "$GITHUB_OUTPUT"
 
-          # 幂等恢复：该 commit 若已带稳定版本 tag，直接沿用（补建 Release/镜像）
-          existing=$(git tag --points-at HEAD --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)
+          # 幂等恢复：该 commit 若已带严格稳定版本 tag，直接沿用（补建 Release/镜像）。
+          # 用 Python 的 STABLE_TAG_RE 判定，不使用宽松数字正则（避免接纳 v01.2.3）。
+          existing=$(python3 - <<'PY'
+          import subprocess, sys
+          sys.path.insert(0, ".github/scripts")
+          from next_version import STABLE_TAG_RE
+          out = subprocess.run(["git","tag","--points-at","HEAD","--list","v*"],
+                               check=True, capture_output=True, text=True).stdout.split()
+          stable = [t for t in out if STABLE_TAG_RE.match(t)]
+          stable.sort(key=lambda t: tuple(int(x) for x in t[1:].split(".")))
+          print(stable[-1] if stable else "")
+          PY
+          )
           if [ -n "${existing:-}" ]; then
             echo "Commit $sha already tagged $existing — resuming publication."
+            # 若该 tag 不是当前最新稳定版本，说明在补推历史版本：别名不得回退
+            newest=$(python3 - <<'PY'
+          import sys
+          sys.path.insert(0, ".github/scripts")
+          from next_version import latest_stable_tag
+          print(latest_stable_tag() or "")
+          PY
+            )
+            if [ "$existing" != "$newest" ]; then
+              echo "::notice::$existing is older than $newest — will only push immutable version tag."
+              echo "resuming_old=true" >> "$GITHUB_OUTPUT"
+            fi
             echo "released=true" >> "$GITHUB_OUTPUT"
             echo "tag=$existing" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          latest=$(python3 - <<'PY'
-          import subprocess, sys
+          if [ -n "${BUMP_INPUT:-}" ] && [ "${BUMP_INPUT}" != "auto" ]; then
+            latest=$(python3 - <<'PY'
+          import sys
           sys.path.insert(0, ".github/scripts")
           from next_version import latest_stable_tag
-          print(latest_stable_tag() or "")
+          print(latest_stable_tag() or "v0.0.0")
           PY
-          )
-
-          if [ -n "${BUMP_INPUT:-}" ] && [ "${BUMP_INPUT}" != "auto" ]; then
-            if [ -z "$latest" ]; then
-              echo "::error::manual bump requires an existing stable tag as base"
-              exit 1
-            fi
+            )
             tag=$(python3 - "$latest" "$BUMP_INPUT" <<'PY'
           import sys
           sys.path.insert(0, ".github/scripts")
@@ -103,15 +125,13 @@ jobs:
           import subprocess, sys
           sys.path.insert(0, ".github/scripts")
           from next_version import classify, parse_commits, latest_stable_tag, bump_version
-          latest = latest_stable_tag()
-          rng = f"{latest}..HEAD" if latest else "HEAD"
+          latest = latest_stable_tag() or "v0.0.0"
+          # 无基线时读完整历史；有基线时读增量
+          rng = f"{latest}..HEAD" if latest != "v0.0.0" else "HEAD"
           raw = subprocess.run(["git","log",rng,"--pretty=format:%s%n%b%x00"],
                                check=True, capture_output=True, text=True).stdout
           bump = classify(parse_commits(raw))
-          if bump == "none":
-              print("none")
-          else:
-              print(bump_version(latest, bump))
+          print("none" if bump == "none" else bump_version(latest, bump))
           PY
             )
             if [ "$result" = "none" ]; then
@@ -169,11 +189,25 @@ jobs:
     if: needs.release.outputs.released == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout release tag
+      # 用 SHA 固定构建对象：tag 可被外部重指，SHA 不会
+      - name: Checkout release commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.release.outputs.tag }}
+          ref: ${{ needs.release.outputs.sha }}
           fetch-depth: 0
+
+      - name: Verify tag points at this commit
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+          SHA: ${{ needs.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag_sha=$(git rev-parse "refs/tags/${TAG}^{}")
+          if [ "$tag_sha" != "$SHA" ]; then
+            echo "::error::tag $TAG resolves to $tag_sha but expected $SHA"
+            exit 1
+          fi
+          echo "Tag $TAG -> $SHA verified."
 
       - name: Set lower-case image name
         run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/netsuck" >> "$GITHUB_ENV"
@@ -191,7 +225,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata
+      # 正常发版：推精确版本 + major.minor + major + latest
+      # 补推历史版本（resuming_old=true）：只推不可变精确版本，避免 latest/major/minor 别名回退
+      - name: Extract Docker metadata (new release)
+        if: needs.release.outputs.resuming_old != 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -202,14 +239,23 @@ jobs:
             type=semver,pattern={{major}},value=${{ needs.release.outputs.tag }}
             type=raw,value=latest
 
+      - name: Extract Docker metadata (backfill old release)
+        if: needs.release.outputs.resuming_old == 'true'
+        id: meta_old
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.release.outputs.tag }}
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags || steps.meta_old.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels || steps.meta_old.outputs.labels }}
           build-args: |
             VERSION=${{ needs.release.outputs.tag }}
           cache-from: type=gha

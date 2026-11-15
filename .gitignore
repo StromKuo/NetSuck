@@ -13,3 +13,7 @@ netsuck
 .DS_Store
 .idea/
 .vscode/
+
+# Python 缓存
+__pycache__/
+*.pyc

@@ -116,6 +116,26 @@ class TestBumpVersion(unittest.TestCase):
             bump_version("vfoo", "patch")
 
 
+class TestFirstRelease(unittest.TestCase):
+    """审查发现：修复幂等逻辑时曾破坏首次发版（无任何 tag 时 latest=None 崩溃）。"""
+
+    def test_no_tag_falls_back_to_v0_0_0(self):
+        # 模拟 release.yml Plan 步骤：latest_stable_tag() 返回空 -> 用 v0.0.0 作基线
+        latest = None or "v0.0.0"
+        self.assertEqual(bump_version(latest, "patch"), "v0.0.1")
+        self.assertEqual(bump_version(latest, "minor"), "v0.1.0")
+        self.assertEqual(bump_version(latest, "major"), "v1.0.0")
+
+    def test_classify_real_history_yields_patch(self):
+        # 仓库无 tag 时会读取完整历史；历史里以 fix:/ci: 为主，应得到非 none
+        commits = commits_from(
+            "fix: repair release pipeline",
+            "docs: update readme",
+            "ci: adjust workflow",
+        )
+        self.assertEqual(classify(commits), "patch")
+
+
 class TestParseCommits(unittest.TestCase):
     def test_subject_and_body_split(self):
         commits = commits_from("fix: subject\n\nbody line\nBREAKING CHANGE: x")

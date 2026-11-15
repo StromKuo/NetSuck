@@ -3,9 +3,10 @@ name: CI
 # 只在「可能影响二进制」的改动上运行：Go 源码、依赖、构建产物配置。
 # 文档（docs/、*.md）、CI 自身、仓库元文件的改动不会触发。
 on:
-  push:
-    branches: [main]
-    paths: &code_paths
+  # main 分支的代码 push 由 release.yml 统一处理：它通过 workflow_call 调用本工作流，
+  # 因此这里不再单独监听 main push，避免同一次提交跑两遍完整校验。
+  pull_request:
+    paths:
       - '**.go'
       - 'go.mod'
       - 'go.sum'
@@ -13,10 +14,9 @@ on:
       - 'config.example.yaml'
       - 'Dockerfile'
       - '.dockerignore'
-  pull_request:
-    paths: *code_paths
   # 供 release.yml 通过 workflow_call 复用，保证发版前一定跑过完整校验
   workflow_call:
+  # 手动单独校验（不发版时排查用）
   workflow_dispatch:
 
 permissions:

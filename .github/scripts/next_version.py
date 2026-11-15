@@ -142,8 +142,11 @@ def main() -> int:
     ap.add_argument("--range", help="git 范围，如 v1.2.3..HEAD")
     args = ap.parse_args()
 
-    latest = args.latest or latest_stable_tag()
-    base_for_range = latest or ""
+    detected = latest_stable_tag()
+    # 首次发版（仓库还没有任何稳定 tag）以 v0.0.0 为基线，
+    # 但 git log 仍读取完整历史以便分类出 patch/minor/major。
+    latest = args.latest or detected or "v0.0.0"
+    base_for_range = detected or ""
 
     if args.commits:
         raw = open(args.commits, encoding="utf-8").read()
@@ -159,10 +162,6 @@ def main() -> int:
     if bump == "none":
         print("version=")
         return 0
-
-    if latest is None:
-        print("error: cannot bump without a stable base tag", file=sys.stderr)
-        return 1
 
     print(f"version={bump_version(latest, bump)}")
     return 0
