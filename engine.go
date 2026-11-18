@@ -2368,6 +2368,7 @@ func (e *Engine) Snapshot() EngineSnapshot {
 		MaxConnections:   maxConns,
 		ActiveConnections: e.activeConns.Load(),
 		TodayBytes:       used,
+		TotalBytes:       e.globalTotal.Load(), // 全量累计（含今日），原子读
 		DailyLimitGB:     limitGB,
 		Schedule:         sched,
 		SnapshotAt:       now,
@@ -3063,6 +3064,7 @@ type EngineSnapshot struct {
 	SpeedMbps         float64        `json:"speed_mbps"`
 	SpeedMBPerSec     float64        `json:"speed_mb_per_sec"`
 	TodayBytes        int64          `json:"today_bytes"`
+	TotalBytes        int64          `json:"total_bytes"` // 全局全量累计（含今日）
 	DailyLimitGB      float64        `json:"daily_limit_gb"`
 	Schedule          ScheduleConfig `json:"schedule"`
 	Targets           []TargetSnapshot `json:"-"`
